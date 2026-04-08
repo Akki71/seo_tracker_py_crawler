@@ -1,18 +1,25 @@
-fastapi==0.111.0
-uvicorn[standard]==0.30.1
-psycopg2-binary==2.9.9
-requests==2.31.0
-beautifulsoup4==4.12.3
-lxml==5.2.2
-html5lib==1.1
-openpyxl==3.1.2
-reportlab==4.2.0
-Pillow==10.3.0
-openai==1.30.1
-anthropic==0.28.0
-python-multipart==0.0.9
-python-dotenv==1.0.1
-urllib3==2.2.1
-celery==5.4.0
-redis==5.0.4
-flower==2.0.1
+# Core API
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+
+# Database
+psycopg2-binary>=2.9.9
+
+# HTTP / Crawling — no pinned urllib3, let requests pick compatible version
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+html5lib>=1.1
+
+# Reports
+openpyxl>=3.1.0
+reportlab>=4.0.0
+Pillow>=10.0.0
+
+# AI providers (optional — only needed if ai_mode != 4)
+openai>=1.30.0
+anthropic>=0.28.0
+
+# Utilities
+python-multipart>=0.0.9

@@ -5,6 +5,7 @@ All DB_CONFIG values are read from environment variables (set in Coolify).
 """
 
 import os, json, logging
+from typing import Optional
 import psycopg2
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import execute_values
@@ -20,7 +21,7 @@ DB_CONFIG = {
     "dbname":   os.environ.get("DB_NAME", "seo_crawler"),
 }
 
-_pool: pg_pool.SimpleConnectionPool | None = None
+_pool = None  # type: Optional[pg_pool.SimpleConnectionPool]
 
 def _get_pool() -> pg_pool.SimpleConnectionPool:
     global _pool

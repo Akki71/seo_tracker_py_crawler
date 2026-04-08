@@ -1,8 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# System deps for psycopg2, Pillow, ReportLab, lxml
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    g++ \
     libpq-dev \
     libjpeg-dev \
     zlib1g-dev \
@@ -15,16 +16,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Install deps first (layer cache)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Create output directory for Excel/PDF files
-RUN mkdir -p output screenshots
+# Runtime directories
+RUN mkdir -p output screenshots logs
 
-# Expose FastAPI port
 EXPOSE 8000
 
-# Startup: init DB schema, then serve
 CMD ["python", "startup.py"]
