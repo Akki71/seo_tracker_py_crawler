@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: seo_crawler
+      POSTGRES_USER: seo_user
+      POSTGRES_PASSWORD: change_me_in_production
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  seo_api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # PostgreSQL
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: seo_user
+      DB_PASSWORD: change_me_in_production
+      DB_NAME: seo_crawler
+      # AI providers (set at least one)
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      # Google PageSpeed
+      PAGESPEED_API_KEY: ""
+    depends_on:
+      - postgres
+    volumes:
+      - ./output:/app/output
+
+volumes:
+  pg_data:
