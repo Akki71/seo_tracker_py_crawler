@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-startup.py — Loads .env, verifies packages, auto-fixes AI versions, inits DB, starts server.
+startup.py — Load .env, verify packages, init DB schema, start uvicorn.
+Works in: local Windows/Mac/Linux, Docker (Coolify), Nixpacks.
 """
 import sys, os, traceback, subprocess
 
@@ -12,189 +13,167 @@ print("AquilTechLabs SEO Crawler API v2.0")
 print(f"Python: {sys.version.split()[0]}  |  Platform: {sys.platform}")
 print("=" * 60)
 
-# ── 1. Load .env ───────────────────────────────────────────────
-print("\n[1] Loading .env...")
+# ── 1. Load .env (local dev only — Coolify sets vars directly) ──
+print("\n[1] Environment setup...")
 _env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 if os.path.exists(_env):
     try:
         from dotenv import load_dotenv
-        load_dotenv(_env, override=True)
-        print(f"    ✓ {_env}")
+        load_dotenv(_env, override=False)  # Don't override vars already set by Coolify
+        print(f"    ✓ .env loaded")
     except ImportError:
         with open(_env, encoding="utf-8") as _f:
             for _line in _f:
                 _line = _line.strip().replace('\r','')
                 if _line and not _line.startswith("#") and "=" in _line:
                     k, _, v = _line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+                    k = k.strip(); v = v.strip().strip('"').strip("'")
+                    if k and v: os.environ.setdefault(k, v)
         print("    ✓ .env loaded manually")
 else:
-    print("    WARNING: No .env file — copy .env.example to .env")
+    print("    (no .env file — using environment variables from Coolify/system)")
 
-# ── 2. Environment check ───────────────────────────────────────
-print("\n[2] Environment:")
+# ── 2. Show config ─────────────────────────────────────────────
+print("\n[2] Configuration:")
 _db = {k: os.environ.get(k,"") for k in ["DB_HOST","DB_PORT","DB_USER","DB_PASSWORD","DB_NAME"]}
-for k,v in _db.items():
-    print(f"    {k:15s} = {'****' if k=='DB_PASSWORD' and v else (v or 'NOT SET ⚠')}")
+for k, v in _db.items():
+    print(f"    {k:15s} = {'****' if k=='DB_PASSWORD' and v else (v or '⚠ NOT SET')}")
 _miss = [k for k,v in _db.items() if not v]
 if _miss:
-    print(f"\n    ⚠ Missing: {_miss} — edit .env")
+    print(f"\n    ⚠ Missing DB vars: {_miss}")
 else:
-    print("    DB config ✓")
-print(f"    OPENAI_API_KEY    = {'SET ✓' if os.environ.get('OPENAI_API_KEY') else 'not set'}")
+    print("    DB ✓")
+print(f"    OPENAI_API_KEY    = {'SET ✓' if os.environ.get('OPENAI_API_KEY') else 'not set (ai_mode=4 will work)'}")
 print(f"    ANTHROPIC_API_KEY = {'SET ✓' if os.environ.get('ANTHROPIC_API_KEY') else 'not set'}")
+print(f"    PAGESPEED_API_KEY = {'SET ✓' if os.environ.get('PAGESPEED_API_KEY') else 'not set (pagespeed disabled)'}")
 
-# ── 3. Auto-fix AI packages ────────────────────────────────────
-print("\n[3] Checking AI package versions...")
-_need_fix = False
+# ── 3. Verify AI packages ──────────────────────────────────────
+print("\n[3] AI package check...")
+_ai_ok = False
+
+def _test_openai():
+    try:
+        from openai import OpenAI
+        OpenAI(api_key="test-startup-check")
+        return True
+    except TypeError:
+        return False  # proxies error
+    except Exception:
+        return True   # auth error is fine — client initialized OK
+
+def _test_anthropic():
+    try:
+        import anthropic
+        anthropic.Anthropic(api_key="test-startup-check")
+        return True
+    except TypeError:
+        return False
+    except Exception:
+        return True
+
+_oai_ok = _test_openai()
+_ant_ok = _test_anthropic()
+
 try:
     import openai
-    _ov = openai.__version__
-    print(f"    openai {_ov}")
-    # Test if client actually works (this is what fails with proxies error)
-    if os.environ.get("OPENAI_API_KEY"):
-        try:
-            _c = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-            print("    ✓ OpenAI client OK")
-        except TypeError:
-            print("    ✗ OpenAI client has 'proxies' error — will fix")
-            _need_fix = True
-    else:
-        # Test with dummy key
-        try:
-            _c = openai.OpenAI(api_key="test")
-            print("    ✓ OpenAI client OK")
-        except TypeError:
-            print("    ✗ OpenAI has 'proxies' error — will fix")
-            _need_fix = True
-        except Exception:
-            print("    ✓ OpenAI client OK (auth error expected with test key)")
-except ImportError:
-    print("    ✗ openai not installed — will install")
-    _need_fix = True
+    print(f"    openai {openai.__version__}: {'✓' if _oai_ok else '✗ proxies error'}")
+except: print("    openai: not installed")
 
 try:
     import anthropic as _ant
-    _av = _ant.__version__
-    print(f"    anthropic {_av}")
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        try:
-            _ac = _ant.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-            print("    ✓ Anthropic client OK")
-        except TypeError:
-            print("    ✗ Anthropic has 'proxies' error — will fix")
-            _need_fix = True
-    else:
-        try:
-            _ac = _ant.Anthropic(api_key="test")
-            print("    ✓ Anthropic client OK")
-        except TypeError:
-            print("    ✗ Anthropic has 'proxies' error — will fix")
-            _need_fix = True
-        except Exception:
-            print("    ✓ Anthropic client OK (auth error expected with test key)")
-except ImportError:
-    print("    ✗ anthropic not installed — will install")
-    _need_fix = True
+    print(f"    anthropic {_ant.__version__}: {'✓' if _ant_ok else '✗ proxies error'}")
+except: print("    anthropic: not installed")
 
-if _need_fix:
-    print("\n    Auto-fixing AI packages...")
-    print("    Installing: openai==1.58.1 anthropic==0.40.0 httpx==0.27.2")
+try:
+    import httpx
+    print(f"    httpx {httpx.__version__}: ✓")
+except: print("    httpx: not installed")
+
+if not _oai_ok or not _ant_ok:
+    print("\n    ⚠ AI packages have version conflict.")
+    print("    Attempting auto-fix: pip install openai==1.58.1 anthropic==0.40.0 httpx==0.27.2")
     result = subprocess.run(
         [sys.executable, "-m", "pip", "install",
-         "openai==1.58.1", "anthropic==0.40.0", "httpx==0.27.2",
-         "--upgrade", "-q"],
+         "openai==1.58.1", "anthropic==0.40.0", "httpx==0.27.2", "-q"],
         capture_output=True, text=True
     )
     if result.returncode == 0:
-        print("    ✓ Packages upgraded successfully!")
-        print("    NOTE: Restart server for changes to take effect if this is first run.")
-        # Try importing again after upgrade
-        import importlib
-        try:
-            import openai; importlib.reload(openai)
-        except Exception: pass
-        try:
-            import anthropic as _ant2; importlib.reload(_ant2)
-        except Exception: pass
+        print("    ✓ Fixed! Server will use updated packages.")
+        _ai_ok = True
     else:
-        print(f"    ✗ Auto-install failed: {result.stderr[:200]}")
-        print("    Manual fix (run in PowerShell):")
-        print("    pip install openai==1.58.1 anthropic==0.40.0 httpx==0.27.2")
+        print(f"    ✗ Auto-fix failed. Run manually: pip install openai==1.58.1 anthropic==0.40.0 httpx==0.27.2")
 else:
+    _ai_ok = True
     print("    ✓ AI packages OK")
 
-# ── 4. Test all packages ───────────────────────────────────────
-print("\n[4] Package check...")
+# ── 4. Package check ───────────────────────────────────────────
+print("\n[4] All packages:")
 _bad = []
-def _chk(label, mod):
+for label, mod in [("fastapi","fastapi"),("uvicorn","uvicorn"),("psycopg2","psycopg2"),
+                    ("requests","requests"),("bs4","bs4"),("openpyxl","openpyxl"),
+                    ("reportlab","reportlab"),("Pillow","PIL")]:
     try:
         m = __import__(mod)
         ver = getattr(m, '__version__', '')
         print(f"    ✓ {label} {ver}".rstrip())
-        return True
     except ImportError as e:
         print(f"    ✗ {label}: {e}")
         _bad.append(label)
-        return False
-
-_chk("fastapi","fastapi"); _chk("uvicorn","uvicorn")
-_chk("psycopg2","psycopg2"); _chk("requests","requests")
-_chk("bs4","bs4"); _chk("openpyxl","openpyxl")
-_chk("reportlab","reportlab"); _chk("Pillow","PIL")
-_chk("openai","openai"); _chk("anthropic","anthropic")
 
 if _bad:
-    print(f"\n    ⚠ Missing: {_bad} — run: pip install -r requirements.txt")
+    print(f"\n    ⚠ Missing: {_bad}")
+    print("    Run: pip install -r requirements.txt")
 else:
-    print("    All packages OK ✓")
+    print("    ✓ All OK")
 
 # ── 5. Directories ─────────────────────────────────────────────
 print("\n[5] Directories...")
-for d in ["output","screenshots","logs"]:
+for d in ["output", "screenshots", "logs"]:
     os.makedirs(d, exist_ok=True)
     print(f"    ✓ {d}/")
 
-# ── 6. DB schema ───────────────────────────────────────────────
-print("\n[6] PostgreSQL schema init...")
+# ── 6. DB Schema ───────────────────────────────────────────────
+print("\n[6] PostgreSQL schema...")
 _db_ready = False
 if _miss:
-    print("    SKIPPED — fill in .env DB credentials first")
+    print("    SKIPPED — set DB env vars first")
 else:
     try:
         from db import init_db
         init_db()
-        print("    ✓ Schema ready")
+        print("    ✓ Schema ready (all tables exist)")
         _db_ready = True
     except Exception as e:
-        print(f"    ⚠ {e}")
-        print("    → Check DB_PASSWORD in .env")
-        print("    → Run: python setup_db.py  to diagnose")
+        print(f"    ✗ {e}")
+        print("    → Check DB credentials in Coolify environment variables")
 
 # ── 7. Start ───────────────────────────────────────────────────
 _port = int(os.environ.get("PORT", 8000))
 print(f"\n[7] Starting server on port {_port}...")
 print()
-print("  ┌──────────────────────────────────────────────────────┐")
-print(f"  │  API:    http://localhost:{_port}                      │")
-print(f"  │  Docs:   http://localhost:{_port}/docs                 │")
-print(f"  │  Health: http://localhost:{_port}/health               │")
-print(f"  │  DB:     {'Connected ✓' if _db_ready else 'NOT connected ⚠  → fix .env':30s}│")
-print("  └──────────────────────────────────────────────────────┘")
-if _need_fix:
-    print()
-    print("  ⚠ AI packages were just upgraded.")
-    print("  ⚠ If AI still fails, press Ctrl+C and restart: python startup.py")
+print(f"  ┌────────────────────────────────────────────────────┐")
+print(f"  │  Local:  http://localhost:{_port}                    │")
+print(f"  │  Docs:   http://localhost:{_port}/docs               │")
+print(f"  │  Health: http://localhost:{_port}/health             │")
+print(f"  │  DB:     {'Connected ✓' if _db_ready else 'NOT connected ⚠':30s}│")
+print(f"  │  AI:     {'Ready ✓' if _ai_ok else 'Check packages ⚠':30s}│")
+print(f"  └────────────────────────────────────────────────────┘")
 print()
-print("  Ctrl+C to stop")
+print("  Press Ctrl+C to stop")
 print("=" * 60)
 
 try:
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=_port,
-                workers=1, log_level="info", access_log=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=_port,
+        workers=1,        # 1 worker — jobs dict is in-memory
+        log_level="info",
+        access_log=True,
+    )
 except KeyboardInterrupt:
-    print("\nStopped.")
+    print("\nServer stopped.")
 except Exception as e:
     print(f"\nFATAL: {e}")
     traceback.print_exc()

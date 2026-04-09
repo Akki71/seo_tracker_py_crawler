@@ -1,12 +1,13 @@
 [phases.setup]
 nixPkgs = [
-  "python312",
+  "python313",
   "gcc",
   "freetype",
   "libjpeg",
   "zlib",
   "libpq",
   "dejavu_fonts",
+  "curl",
 ]
 
 [phases.install]
@@ -16,4 +17,4 @@ cmds = [
 ]
 
 [start]
-cmd = "python startup.py"
+cmd = "python -u startup.py"

@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Deps layer (cached unless requirements.txt changes)
+# Install deps (cached unless requirements.txt changes)
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
@@ -30,11 +30,11 @@ RUN pip install --upgrade pip && \
 # App code
 COPY . .
 
-# Runtime dirs
+# Runtime dirs — output persisted via Coolify volume mount
 RUN mkdir -p /app/output /app/screenshots /app/logs
 
-# Health check so Coolify knows when it's ready
-HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+# Health check
+HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 EXPOSE 8000
