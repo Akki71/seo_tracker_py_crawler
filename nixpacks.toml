@@ -1,0 +1,19 @@
+[phases.setup]
+nixPkgs = [
+  "python312",
+  "gcc",
+  "freetype",
+  "libjpeg",
+  "zlib",
+  "libpq",
+  "dejavu_fonts",
+]
+
+[phases.install]
+cmds = [
+  "pip install --upgrade pip setuptools wheel",
+  "pip install -r requirements.txt"
+]
+
+[start]
+cmd = "python startup.py"

@@ -1,279 +1,290 @@
 # AquilTechLabs SEO Crawler API v2.0
 
-Full SEO audit system converted to a REST API with PostgreSQL storage.  
-Accepts `brand_id` + `url` → crawls, runs AI analysis, exports Excel + PDF, saves everything to Postgres.
+Full SEO audit REST API — crawl + AI analysis + Excel/PDF export + PostgreSQL storage.
 
 ---
 
-## 📁 Project Structure
+## 🖥️ Run Locally (Your Computer)
 
+### Prerequisites
+- Python 3.10 or newer → https://python.org/downloads
+- PostgreSQL database (local or remote)
+
+---
+
+### Option A — Mac / Linux / WSL (easiest)
+
+```bash
+# 1. Open terminal in the project folder
+cd seo_crawler_api
+
+# 2. Run the setup script
+./run_local.sh
 ```
-seo_crawler_api/
-├── main.py            ← FastAPI app (routes, job tracking)
-├── crawler.py         ← Core crawl + analyze orchestrator
-├── db.py              ← PostgreSQL layer (schema, all insert/update helpers)
-├── ai_helpers.py      ← All OpenAI / Claude AI calls
-├── excel_export.py    ← Excel report generator
-├── pdf_export.py      ← PDF report generator
-├── scorecard.py       ← Pass/fail scorecard builder
-├── startup.py         ← Init DB schema + start uvicorn
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml ← For local testing
-└── README.md
+
+The script will:
+- Create a Python virtual environment
+- Install all packages
+- Create `.env` from `.env.example`
+- Ask you to fill in DB credentials
+- Start the server at http://localhost:8000
+
+---
+
+### Option B — Windows
+
+```cmd
+# Double-click run_local.bat
+# OR open Command Prompt in the folder and run:
+run_local.bat
 ```
 
 ---
 
-## 🔑 Environment Variables
+### Option C — Manual steps (any OS)
 
-Set these in Coolify → Service → Environment Variables:
+```bash
+# 1. Create virtual environment
+python -m venv venv
 
-| Variable             | Required | Description                          |
-|----------------------|----------|--------------------------------------|
-| `DB_HOST`            | ✅       | PostgreSQL host                      |
-| `DB_PORT`            | ✅       | PostgreSQL port (default: 5432)      |
-| `DB_USER`            | ✅       | PostgreSQL username                  |
-| `DB_PASSWORD`        | ✅       | PostgreSQL password                  |
-| `DB_NAME`            | ✅       | PostgreSQL database name             |
-| `OPENAI_API_KEY`     | ⚠️ one  | For ai_mode 1 or 3                   |
-| `ANTHROPIC_API_KEY`  | ⚠️ one  | For ai_mode 2 or 3                   |
-| `PAGESPEED_API_KEY`  | optional | Google PageSpeed Insights key        |
+# 2. Activate it
+# Mac/Linux:
+source venv/bin/activate
+# Windows:
+venv\Scripts\activate
+
+# 3. Install packages
+pip install -r requirements.txt
+
+# 4. Create .env file
+cp .env.example .env
+# Edit .env with your DB credentials
+
+# 5. Load env vars
+# Mac/Linux:
+export $(grep -v '^#' .env | xargs)
+# Windows CMD: set vars manually or use the .bat script
+
+# 6. Start
+python startup.py
+```
 
 ---
 
-## 🚀 Coolify Deployment
+### Testing Locally
 
-### Step 1 — Push to Git
-Push this folder to a GitHub/GitLab repo.
+After starting, open a new terminal:
 
-### Step 2 — New Service in Coolify
-1. Coolify Dashboard → **New Service** → **Dockerfile**
-2. Connect your Git repo
-3. Set **Port**: `8000`
-4. Add all environment variables (see table above)
-5. **Deploy**
+```bash
+# Health check
+curl http://localhost:8000/health
 
-### Step 3 — Verify
+# Start an audit (ai_mode=4 = skip AI, fastest for testing)
+curl -X POST http://localhost:8000/audit/start \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com","brand_id":1,"ai_mode":"4","crawl_limit":5}'
+
+# You'll get back a job_id — poll status:
+curl http://localhost:8000/audit/status/YOUR_JOB_ID_HERE
+
+# Interactive API docs (open in browser):
+open http://localhost:8000/docs
 ```
-GET https://your-coolify-domain.com/health
-→ {"status":"ok","service":"AquilTechLabs SEO Crawler API","version":"2.0.0"}
+
+---
+
+## 🌐 Coolify Deployment (GoDaddy Domain)
+
+### Step 1 — Push to GitHub
+
+```bash
+cd seo_crawler_api
+git init
+git add .
+git commit -m "SEO Crawler API v2.0"
+# Create a repo on github.com, then:
+git remote add origin https://github.com/YOUR_USER/seo-crawler-api.git
+git push -u origin main
 ```
 
-### Step 4 — Database
-The API auto-creates all tables on first startup via `startup.py → init_db()`.  
-No manual SQL migration needed.
+### Step 2 — Coolify Setup
+
+1. Log in to your Coolify dashboard
+2. Click **+ New Resource** → **Application**
+3. Connect your GitHub repo
+4. **Build Pack**: Select **Nixpacks** (it auto-detects via `nixpacks.toml`)
+5. **Port**: `8000`
+
+### Step 3 — Environment Variables in Coolify
+
+In Coolify → your service → **Environment Variables**, add:
+
+```
+DB_HOST        = your-postgres-host
+DB_PORT        = 5432
+DB_USER        = your_db_user
+DB_PASSWORD    = your_db_password
+DB_NAME        = seo_crawler
+OPENAI_API_KEY = sk-...          (for ai_mode 1 or 3)
+ANTHROPIC_API_KEY = sk-ant-...   (for ai_mode 2 or 3)
+PAGESPEED_API_KEY = AIza...      (optional)
+PORT           = 8000
+```
+
+### Step 4 — GoDaddy Domain
+
+1. In Coolify → your service → **Domains**, add your domain:
+   ```
+   seo-crawler.yourdomain.com
+   ```
+2. In GoDaddy DNS → add a **CNAME** record:
+   ```
+   Type:  CNAME
+   Name:  seo-crawler          (subdomain you want)
+   Value: your-coolify-server-ip-or-hostname
+   TTL:   600
+   ```
+   OR add an **A** record pointing to your server IP.
+3. Enable **HTTPS** in Coolify (it auto-provisions Let's Encrypt certificate)
+4. Deploy — wait ~2 min for DNS to propagate
+
+### Step 5 — Verify Deployment
+
+```bash
+# Replace with your actual domain
+curl https://seo-crawler.yourdomain.com/health
+```
+
+Expected response:
+```json
+{
+  "status": "ok",
+  "version": "2.0.0",
+  "database": "connected",
+  "active_jobs": 0
+}
+```
 
 ---
 
 ## 📡 API Reference
 
-### Base URL
-```
-https://your-coolify-domain.com
-```
+### POST /audit/start
 
----
+Start a full SEO audit. Returns instantly with a `job_id`.
 
-### `GET /health`
-Health check.
-
-**Response:**
-```json
-{"status": "ok", "service": "AquilTechLabs SEO Crawler API", "version": "2.0.0"}
-```
-
----
-
-### `POST /audit/start`
-Start a full SEO audit in the background.
-
-**Request Body:**
+**Request:**
 ```json
 {
-  "url": "https://example.com",
-  "brand_id": 42,
-  "target_location": "Mumbai, India",
-  "ai_mode": "1",
+  "url": "https://gulfpharmacy.com/",
+  "brand_id": 103,
+  "ai_mode": "3",
   "crawl_limit": 100,
-  "run_pagespeed": true
+  "target_location": "Dubai, UAE",
+  "run_pagespeed": false
 }
 ```
 
-| Field             | Type    | Required | Description                                              |
-|-------------------|---------|----------|----------------------------------------------------------|
-| `url`             | string  | ✅       | Website URL to audit                                     |
-| `brand_id`        | integer | ✅       | Your brands table primary key                            |
-| `target_location` | string  | ❌       | e.g. "Mumbai, India" — used for keyword context          |
-| `ai_mode`         | string  | ❌       | `"1"`=OpenAI, `"2"`=Claude, `"3"`=Hybrid, `"4"`=Skip AI |
-| `crawl_limit`     | integer | ❌       | Max pages to crawl (default: 100)                        |
-| `run_pagespeed`   | boolean | ❌       | Run Google PageSpeed for each page (default: true)       |
+**ai_mode values:**
+| Value | Description |
+|-------|-------------|
+| `"1"` | OpenAI only (GPT-4o-mini) — needs OPENAI_API_KEY |
+| `"2"` | Claude only (Haiku + Sonnet) — needs ANTHROPIC_API_KEY |
+| `"3"` | Hybrid: OpenAI bulk + Claude strategy — needs both keys |
+| `"4"` | **Skip AI** — crawl only, fastest, free |
 
 **Response:**
 ```json
 {
-  "job_id": "a1b2c3d4-...",
+  "job_id": "a1b2c3d4-e5f6-...",
   "status": "queued",
-  "message": "Audit started",
-  "audit_id": null,
-  "excel_file": null,
-  "pdf_file": null,
-  "started_at": "2024-01-15T10:30:00",
-  "completed_at": null,
-  "error": null
+  "message": "Audit queued for https://gulfpharmacy.com/",
+  "started_at": "2024-01-15T10:30:00"
 }
 ```
 
 ---
 
-### `GET /audit/status/{job_id}`
-Poll job status.
+### GET /audit/status/{job_id}
 
-**Status values:** `queued` → `running` → `completed` | `failed`
+Poll until `status` = `completed` or `failed`.
 
-**Response (completed):**
-```json
-{
-  "job_id": "a1b2c3d4-...",
-  "status": "completed",
-  "message": "Audit completed successfully",
-  "audit_id": 7,
-  "excel_file": "output/example.com_20240115_103045_SEO.xlsx",
-  "pdf_file": "output/example.com_20240115_103045_SEO.pdf",
-  "started_at": "2024-01-15T10:30:00",
-  "completed_at": "2024-01-15T10:45:22",
-  "error": null
-}
-```
+| Status | Meaning |
+|--------|---------|
+| `queued` | Waiting to start |
+| `running` | Crawling / analyzing |
+| `completed` | Done — download files |
+| `failed` | Error — check `error` field |
 
 ---
 
-### `GET /audit/download/{job_id}/excel`
-Download the Excel report once status is `completed`.
+### GET /audit/download/{job_id}/excel
+### GET /audit/download/{job_id}/pdf
 
-### `GET /audit/download/{job_id}/pdf`
-Download the PDF report once status is `completed`.
-
----
-
-### `GET /brand/{brand_id}/audits`
-List all audits for a brand.
-
-**Response:**
-```json
-{
-  "brand_id": 42,
-  "audits": [
-    {
-      "id": 7,
-      "domain": "example.com",
-      "base_url": "https://example.com",
-      "audit_status": "complete",
-      "total_pages_crawled": 45,
-      "pages_200": 40,
-      "pages_404": 3,
-      "broken_links_count": 2,
-      "audit_timestamp": "2024-01-15T10:30:00"
-    }
-  ]
-}
-```
+Download reports. Only works when status = `completed`.
 
 ---
 
-### `GET /audit/{audit_id}`
-Get full audit record from PostgreSQL.
+### GET /brand/{brand_id}/audits
+
+List all audits for a brand from PostgreSQL.
 
 ---
 
-## 🔄 Typical Workflow (Client Code)
+## 🔄 Complete Usage Example
 
 ```python
 import requests, time
 
-API = "https://your-coolify-domain.com"
+API = "https://seo-crawler.yourdomain.com"
 
 # 1. Start audit
-resp = requests.post(f"{API}/audit/start", json={
-    "url": "https://example.com",
-    "brand_id": 42,
-    "target_location": "London, UK",
+r = requests.post(f"{API}/audit/start", json={
+    "url": "https://gulfpharmacy.com/",
+    "brand_id": 103,
     "ai_mode": "3",
-    "crawl_limit": 200,
+    "crawl_limit": 100,
+    "run_pagespeed": False,
 })
-job_id = resp.json()["job_id"]
-print(f"Job started: {job_id}")
+job_id = r.json()["job_id"]
+print(f"Started: {job_id}")
 
-# 2. Poll until done
+# 2. Poll status every 15 seconds
 while True:
-    status = requests.get(f"{API}/audit/status/{job_id}").json()
-    print(f"Status: {status['status']} — {status['message']}")
-    if status["status"] in ("completed", "failed"):
+    s = requests.get(f"{API}/audit/status/{job_id}").json()
+    print(f"Status: {s['status']} — {s['message']}")
+    if s["status"] in ("completed", "failed"):
         break
     time.sleep(15)
 
 # 3. Download files
-if status["status"] == "completed":
-    excel = requests.get(f"{API}/audit/download/{job_id}/excel")
-    with open("report.xlsx", "wb") as f:
-        f.write(excel.content)
-
-    pdf = requests.get(f"{API}/audit/download/{job_id}/pdf")
-    with open("report.pdf", "wb") as f:
-        f.write(pdf.content)
-
-    print(f"Reports downloaded! audit_id={status['audit_id']}")
+if s["status"] == "completed":
+    # Excel
+    r = requests.get(f"{API}/audit/download/{job_id}/excel")
+    open("report.xlsx", "wb").write(r.content)
+    # PDF
+    r = requests.get(f"{API}/audit/download/{job_id}/pdf")
+    open("report.pdf", "wb").write(r.content)
+    print(f"Downloaded! audit_id={s['audit_id']}")
+else:
+    print(f"Failed: {s['error']}")
 ```
 
 ---
 
-## 🗄️ Database Schema
+## 🐛 Troubleshooting
 
-All tables are auto-created on startup. Key tables:
+### 503 No Available Server
+- Check Coolify logs → your service → **Logs** tab
+- Most common cause: missing DB env vars
+- Try: set `ai_mode=4` to skip AI and test crawl only
 
-| Table                  | Description                              |
-|------------------------|------------------------------------------|
-| `audits`               | One row per audit run (has `brand_id`)   |
-| `pages`                | One row per crawled page                 |
-| `broken_links`         | Broken link records                      |
-| `images`               | Image alt audit records                  |
-| `seo_keywords`         | AI-detected keywords per service         |
-| `blog_topics`          | AI blog topic ideas                      |
-| `backlink_strategies`  | Backlink strategy by category            |
-| `six_month_plan`       | Month-by-month execution plan            |
-| `internal_linking`     | Internal link strategy                   |
-| `keyword_url_mapping`  | Keyword to page mapping                  |
-| `axo_recommendations`  | AXO (AI Experience Optimization)         |
-| `scorecard`            | Pass/fail scorecard results              |
-| `aeo_faq`              | FAQ schema content                       |
-| `audit_progress`       | Crawl resume tracking                    |
-| `site_analysis`        | HTTP status distribution, depth maps     |
-| `generated_files`      | sitemap.xml, robots.txt etc.             |
+### DB Connection Failed
+- Ensure PostgreSQL is accessible from Coolify's network
+- Check `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
+- Tables are auto-created on first successful connection
 
----
-
-## 🤖 AI Modes
-
-| Mode | Description                              | Best For           |
-|------|------------------------------------------|--------------------|
-| `1`  | OpenAI only (GPT-4o-mini)               | Cost-efficient     |
-| `2`  | Claude only (Haiku bulk + Sonnet strat.) | Quality            |
-| `3`  | Hybrid: GPT-4o-mini bulk + Sonnet strat.| Best cost/quality  |
-| `4`  | Skip AI — crawl only                     | Speed / free       |
-
----
-
-## 🧪 Local Testing
-
-```bash
-# Start postgres + api
-docker compose up --build
-
-# Test health
-curl http://localhost:8000/health
-
-# Start audit
-curl -X POST http://localhost:8000/audit/start \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com","brand_id":1,"ai_mode":"4","crawl_limit":10}'
-```
+### Job stays in "running" forever
+- Check server logs for traceback
+- Reduce `crawl_limit` (try 10 first)
+- Use `ai_mode=4` (skip AI) to isolate the issue

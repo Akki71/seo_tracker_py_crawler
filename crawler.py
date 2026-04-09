@@ -630,21 +630,47 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     detected_location = target_location or _detect_location(domain)
 
     # ── Save crawled pages to DB ───────────────────────────────────────────────
-    conn = get_db_conn()
-    try:
-        for p in pages_list:
-            try:
-                db_insert_page(conn, audit_id, p)
-                db_mark_url_progress(conn, audit_id, p.get("url",""), "crawled",
-                                     str(p.get("status","")))
-            except Exception as e:
-                logger.error(f"DB page insert error ({p.get('url','')}): {e}")
-        if images_list:
-            db_insert_images_batch(conn, audit_id, images_list)
-        if broken_links_list:
-            db_insert_broken_links_batch(conn, audit_id, broken_links_list)
-    finally:
-        release_db_conn(conn)
+    # Each page gets its own connection so one failure cannot cascade to others
+    saved_pages = 0
+    failed_pages = 0
+    for p in pages_list:
+        _conn = get_db_conn()
+        try:
+            db_insert_page(_conn, audit_id, p)
+            db_mark_url_progress(_conn, audit_id, p.get("url",""), "crawled",
+                                 str(p.get("status","")))
+            saved_pages += 1
+        except Exception as e:
+            failed_pages += 1
+            logger.error(f"DB page insert error ({p.get('url','')[:60]}): {e}")
+            try: _conn.rollback()
+            except Exception: pass
+        finally:
+            release_db_conn(_conn)
+
+    logger.info(f"Pages saved to DB: {saved_pages} OK, {failed_pages} failed")
+
+    if images_list:
+        _conn = get_db_conn()
+        try:
+            db_insert_images_batch(_conn, audit_id, images_list)
+        except Exception as e:
+            logger.error(f"DB images batch error: {e}")
+            try: _conn.rollback()
+            except Exception: pass
+        finally:
+            release_db_conn(_conn)
+
+    if broken_links_list:
+        _conn = get_db_conn()
+        try:
+            db_insert_broken_links_batch(_conn, audit_id, broken_links_list)
+        except Exception as e:
+            logger.error(f"DB broken links batch error: {e}")
+            try: _conn.rollback()
+            except Exception: pass
+        finally:
+            release_db_conn(_conn)
 
     # ── AI + PageSpeed ─────────────────────────────────────────────────────────
     pages_200 = [p for p in pages_list if _is_200(p)]
@@ -722,24 +748,33 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     # ── Generated SEO files ────────────────────────────────────────────────────
     generated_files = _generate_seo_files(base_url, domain, pages_list, broken_links_list)
 
-    # ── DB — save site-wide data ───────────────────────────────────────────────
-    conn = get_db_conn()
-    try:
-        db_insert_keywords(conn, audit_id, keyword_data)
-        db_insert_blog_topics(conn, audit_id, blog_topics_data)
-        db_insert_backlinks(conn, audit_id, backlink_strategy_data)
-        db_insert_plan(conn, audit_id, six_month_plan_data)
-        db_insert_internal_linking(conn, audit_id, internal_linking_data)
-        db_insert_kw_url_map(conn, audit_id, keyword_url_map_data)
-        db_insert_axo(conn, audit_id, axo_data)
-        db_insert_scorecard(conn, audit_id, scorecard_results, global_checks)
-        db_insert_aeo_faq(conn, audit_id, pages_list)
-        db_insert_site_analysis(conn, audit_id, site_analysis_data)
-        db_insert_generated_files(conn, audit_id, generated_files)
-    except Exception as e:
-        logger.error(f"DB site-wide save error: {e}")
-    finally:
-        release_db_conn(conn)
+    # ── DB — save site-wide data (each table isolated so one failure doesn't stop others) ──
+    def _safe_db_insert(label, func, *args):
+        """Insert with isolated connection so one failure doesn't cascade."""
+        _c = get_db_conn()
+        try:
+            func(_c, *args)
+            logger.info(f"  DB saved: {label}")
+        except Exception as _e:
+            logger.error(f"  DB FAILED {label}: {_e}")
+            try: _c.rollback()
+            except Exception: pass
+        finally:
+            release_db_conn(_c)
+
+    logger.info(f"Saving site-wide data to DB (audit #{audit_id})...")
+    _safe_db_insert("scorecard",         db_insert_scorecard,         audit_id, scorecard_results, global_checks)
+    _safe_db_insert("aeo_faq",           db_insert_aeo_faq,           audit_id, pages_list)
+    _safe_db_insert("site_analysis",     db_insert_site_analysis,     audit_id, site_analysis_data)
+    _safe_db_insert("generated_files",   db_insert_generated_files,   audit_id, generated_files)
+    _safe_db_insert("seo_keywords",      db_insert_keywords,          audit_id, keyword_data)
+    _safe_db_insert("blog_topics",       db_insert_blog_topics,       audit_id, blog_topics_data)
+    _safe_db_insert("backlink_strategies",db_insert_backlinks,        audit_id, backlink_strategy_data)
+    _safe_db_insert("six_month_plan",    db_insert_plan,              audit_id, six_month_plan_data)
+    _safe_db_insert("internal_linking",  db_insert_internal_linking,  audit_id, internal_linking_data)
+    _safe_db_insert("keyword_url_map",   db_insert_kw_url_map,        audit_id, keyword_url_map_data)
+    _safe_db_insert("axo_recommendations",db_insert_axo,              audit_id, axo_data)
+    logger.info("All site-wide DB saves complete.")
 
     # ── Excel & PDF exports ────────────────────────────────────────────────────
     from excel_export import generate_excel

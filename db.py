@@ -338,20 +338,93 @@ CREATE INDEX IF NOT EXISTS idx_images_audit_id    ON images(audit_id);
 CREATE INDEX IF NOT EXISTS idx_progress_audit_url ON audit_progress(audit_id, url);
 """
 
+# All columns the pages table MUST have (column_name, column_definition)
+PAGES_REQUIRED_COLUMNS = [
+    ("viewport_configured",  "TEXT"),
+    ("html_size_kb",         "NUMERIC(10,2)"),
+    ("html_size_issue",      "TEXT"),
+    ("is_secure",            "TEXT"),
+    ("mixed_content",        "TEXT"),
+    ("mixed_content_details","TEXT"),
+    ("unminified_js",        "TEXT"),
+    ("unminified_js_details","TEXT"),
+    ("unminified_css",       "TEXT"),
+    ("unminified_css_details","TEXT"),
+    ("amp_link",             "TEXT"),
+    ("og_validation",        "TEXT"),
+    ("x_robots_noindex",     "TEXT"),
+    ("page_cache_control",   "TEXT"),
+    ("crawl_depth",          "INTEGER DEFAULT -1"),
+    ("hreflang_tags",        "TEXT"),
+    ("body_copy_guidance",   "TEXT"),
+    ("aeo_faq",              "TEXT"),
+    ("spam_malware_flags",   "TEXT"),
+    ("serp_preview",         "TEXT"),
+    ("image_optimization_tips", "TEXT"),
+]
+
+AUDITS_REQUIRED_COLUMNS = [
+    ("brand_id",             "INTEGER"),
+    ("detected_location",    "TEXT"),
+    ("site_recommendation",  "TEXT"),
+    ("audit_status",         "TEXT DEFAULT 'in_progress'"),
+    ("llm_txt_status",       "TEXT"),
+    ("gbp_status",           "TEXT"),
+]
+
+
 def init_db():
-    """Create all tables if they don't exist. Call once on startup."""
+    """Create all tables, then run ALTER TABLE migrations for any missing columns."""
     conn = get_db_conn()
     try:
+        # Step 1: Create tables (idempotent)
         with conn.cursor() as cur:
             cur.execute(CREATE_TABLES_SQL)
         conn.commit()
+
+        # Step 2: Add any missing columns to existing tables (safe migration)
+        _migrate_columns(conn, "pages",  PAGES_REQUIRED_COLUMNS)
+        _migrate_columns(conn, "audits", AUDITS_REQUIRED_COLUMNS)
+
         logger.info("PostgreSQL schema initialized.")
     except Exception as e:
-        conn.rollback()
+        try: conn.rollback()
+        except Exception: pass
         logger.error(f"Schema init error: {e}")
         raise
     finally:
         release_db_conn(conn)
+
+
+def _migrate_columns(conn, table: str, required_cols: list):
+    """Add any columns missing from table — safe to run repeatedly."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = %s AND table_schema = 'public'
+            """, (table,))
+            existing = {row[0] for row in cur.fetchall()}
+
+        added = []
+        for col_name, col_def in required_cols:
+            if col_name not in existing:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_def}')
+                    conn.commit()
+                    added.append(col_name)
+                    logger.info(f"Migration: added column {table}.{col_name}")
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning(f"Migration: could not add {table}.{col_name}: {e}")
+
+        if added:
+            logger.info(f"Migration complete: added {len(added)} columns to {table}: {added}")
+        else:
+            logger.info(f"Migration: {table} schema is up to date")
+    except Exception as e:
+        logger.error(f"Migration error for {table}: {e}")
 
 # ── DB Helper Functions ────────────────────────────────────────────────────────
 
@@ -453,9 +526,14 @@ def db_insert_page(conn, audit_id: int, p: dict):
             val = _safe(val)
         row.append(val)
 
-    with conn.cursor() as cur:
-        cur.execute(f"INSERT INTO pages ({col_str}) VALUES ({placeholders})", row)
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"INSERT INTO pages ({col_str}) VALUES ({placeholders})", row)
+        conn.commit()
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        raise
 
 
 def db_update_page_ai(conn, audit_id: int, url: str, p: dict):
@@ -536,6 +614,7 @@ def db_insert_broken_links_batch(conn, audit_id: int, broken: list):
 
 def db_insert_keywords(conn, audit_id: int, kw_data: dict):
     if not kw_data.get("services"):
+        logger.info(f"  db_insert_keywords: skipped (no services data)")
         return
     rows = []
     for svc in kw_data["services"]:
@@ -557,6 +636,7 @@ def db_insert_keywords(conn, audit_id: int, kw_data: dict):
 
 def db_insert_blog_topics(conn, audit_id: int, blog_data: list):
     if not blog_data:
+        logger.info(f"  db_insert_blog_topics: skipped (no blog data)")
         return
     rows = []
     for svc in blog_data:
@@ -574,6 +654,7 @@ def db_insert_blog_topics(conn, audit_id: int, blog_data: list):
 
 def db_insert_backlinks(conn, audit_id: int, bl_data: dict):
     if not bl_data:
+        logger.info(f"  db_insert_backlinks: skipped (no backlink data)")
         return
     rows = []
     for cat in ["seo_backlinks","aeo_backlinks","geo_backlinks","pr_backlinks"]:
@@ -597,6 +678,7 @@ def db_insert_backlinks(conn, audit_id: int, bl_data: dict):
 
 def db_insert_plan(conn, audit_id: int, plan_data: dict):
     if not plan_data or not plan_data.get("months"):
+        logger.info(f"  db_insert_plan: skipped (no plan data)")
         return
     rows = [(audit_id, m.get("month_number", i+1), m.get("month_label",""),
              m.get("theme",""), json.dumps(m.get("tasks",[]), default=str)[:10000],
