@@ -2,6 +2,7 @@
 ai_helpers.py — All AI provider calls.
 Compatible with: openai==1.59.0 + anthropic==0.40.0 + httpx==0.28.1
 """
+
 import os, json, re, logging
 from typing import Optional
 
@@ -322,3 +323,35 @@ Images:{img_list}"""
             if 0 <= idx < len(batch): result[batch[idx]["src"]] = v
         return result
     except Exception as e: logger.error(f"ai_alt_recommendations: {e}"); return {}
+
+
+
+AI_HELPERS_ADDITION = '''
+ 
+def ai_new_page_suggestions(pages_data: list, keyword_data: dict,
+                             domain: str, brand: str, location: str = "Global") -> list:
+    """Suggest NEW pages to create based on keyword gaps and site structure."""
+    if not _has_client() or not pages_data:
+        return []
+    existing_urls = [p.get("url", "") for p in pages_data[:50]]
+    services = [s.get("service", "") for s in keyword_data.get("services", [])]
+    all_kws = []
+    for svc in keyword_data.get("services", []):
+        all_kws.extend(svc.get("keywords", [])[:5])
+    existing_list = "\\n".join(f"- {u}" for u in existing_urls[:30])
+    prompt = f"""SEO strategist. Suggest 5-10 NEW pages to create to fill SEO gaps.
+Return ONLY JSON array (no markdown):
+[{{"url":"/suggested-url-slug","title":"Page Title 30-60 chars","page_type":"service|location|blog|resource|landing","reason":"why needed","target_keyword":"main keyword","content_outline":["Section 1","Section 2","Section 3","Section 4","Section 5"],"priority":"high|medium|low"}}]
+Website:{domain} Brand:{brand} Location:{location}
+Services:{", ".join(services)}
+Keywords:{", ".join(all_kws[:15])}
+Existing pages:
+{existing_list}"""
+    try:
+        result = _parse_arr(ai_chat(prompt, max_tokens=3000, temperature=0.4, use_sonnet=True))
+        logger.info(f"New page suggestions: {len(result)} pages recommended")
+        return result if isinstance(result, list) else []
+    except Exception as e:
+        logger.error(f"ai_new_page_suggestions: {e}")
+        return []
+'''

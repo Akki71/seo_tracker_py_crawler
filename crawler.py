@@ -1,7 +1,20 @@
 """
 crawler.py — Core SEO crawl + analyze logic.
 Called by run_audit() from the API background task.
-All imports are deferred/guarded so startup never crashes.
+
+Merged from crawler_1.py (old monolith) into this API-compatible version.
+Key additions vs original ZIP:
+  - body_copy_guidance AI call (per page, first 50 pages)
+  - ai_alt_recommendations for missing-ALT images
+  - ai_new_page_suggestions  (new page gaps)
+  - Full spam/malware detection on each page
+  - SSL expiry, WWW resolve, sitemap size checks
+  - Full _build_site_analysis (crawl depth, hreflang, sitemap comparison)
+  - Full _generate_seo_files (robots, sitemap, llms.txt, .htaccess, nginx, broken-link report)
+  - db_insert_new_page_suggestions DB save
+  - Scorecard google_search_console check fixed
+  - _analyze_pages includes body_copy_guidance
+  - ai_mode logged correctly in run_audit
 """
 
 import os, re, json, time, hashlib, logging, sys, base64, io
@@ -47,7 +60,7 @@ SKIP_PATTERNS = [
 
 PAGESPEED_API_KEY = os.environ.get("PAGESPEED_API_KEY", "")
 
-# ── Lazy session (created once per process) ───────────────────────────────────
+# ── Lazy session ──────────────────────────────────────────────────────────────
 
 _session = None
 
@@ -171,6 +184,7 @@ def _serp_preview(url, title, desc):
 
 
 def _check_file(domain, path, sitemap_urls_out=None):
+    """Validate robots.txt, sitemap.xml, and llms.txt with content checks."""
     for scheme in ["https", "http"]:
         try:
             r = _safe_get(f"{scheme}://{domain}/{path}", timeout=12)
@@ -195,10 +209,33 @@ def _check_file(domain, path, sitemap_urls_out=None):
                     except ET.ParseError:
                         return "Invalid (XML parse error)"
                 elif path == "robots.txt":
+                    if "user-agent" not in content.lower():
+                        return "Invalid (no User-agent directive)"
                     has_sitemap = "sitemap:" in content.lower()
-                    return "Valid" + (" + Sitemap ref" if has_sitemap else "")
+                    # Check for blocking
+                    is_blocking_all = False
+                    current_agent = ""
+                    for line in content.lower().split('\n'):
+                        line = line.strip()
+                        if line.startswith("user-agent:"):
+                            current_agent = line.split(":", 1)[1].strip()
+                        elif line.startswith("disallow:") and current_agent:
+                            disallow_path = line.split(":", 1)[1].strip()
+                            if disallow_path == "/" and current_agent == "*":
+                                is_blocking_all = True
+                    if is_blocking_all:
+                        status = "BLOCKING ALL BOTS (Disallow: /)"
+                    else:
+                        status = "Valid"
+                    status += " + Sitemap ref" if has_sitemap else " (no Sitemap ref)"
+                    return status
                 elif path == "llms.txt":
-                    return f"Present ({len(content)} chars)"
+                    has_heading = content.startswith('#') or '##' in content
+                    has_links = 'http' in content.lower()
+                    if has_heading and has_links:
+                        return f"Present ({len(content)} chars)"
+                    else:
+                        return f"Present ({len(content)} chars, no headings)" if has_links else f"Present ({len(content)} chars)"
                 return "Present"
             elif r.status_code == 403:
                 return "Blocked (403)"
@@ -252,11 +289,11 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
     except Exception as e:
         err_str = str(e)
         if "Timeout" in err_str or "timed out" in err_str.lower():
-            pd["status"] = "Timeout"
+            pd["status"] = "Timeout — server took too long to respond"
         elif "ConnectionError" in err_str or "Connection" in err_str:
-            pd["status"] = "Connection Error"
+            pd["status"] = "Connection Error - server refused/DNS failed/SSL issue"
         else:
-            pd["status"] = f"Error: {err_str[:60]}"
+            pd["status"] = f"Error: {err_str[:80]}"
         with pages_lock:
             pages_list.append(pd)
         return []
@@ -296,6 +333,7 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
 
     text_content = _clean(soup.get_text())
     word_count = len(text_content.split())
+    page_source = html_text
 
     # Canonical
     can_tag = soup.find("link", rel="canonical")
@@ -330,15 +368,15 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
     pd["h2_tags"]                 = " | ".join(h2_list) if h2_list else "None"
 
     # GA
-    ga_markers = ["gtag(", "G-", "UA-", "google-analytics.com", "googletagmanager.com"]
-    pd["google_analytics"] = "Yes" if any(m in html_text for m in ga_markers) else "No"
+    ga_markers = ["gtag(", "G-", "UA-", "google-analytics.com", "googletagmanager.com", "analytics.js", "gtm.js"]
+    pd["google_analytics"] = "Yes" if any(m in page_source for m in ga_markers) else "No"
 
     # GSC (homepage only)
     is_hp = (_normalize(url) == _normalize(base_url) or
              urlparse(url).path in ("", "/", "/index.html", "/index.php"))
     if is_hp:
         gsc_meta = soup.find("meta", attrs={"name": "google-site-verification"})
-        pd["google_search_console"] = "Yes" if gsc_meta else "No"
+        pd["google_search_console"] = "Yes" if gsc_meta or "google-site-verification" in page_source else "No"
     else:
         pd["google_search_console"] = "Homepage Only"
 
@@ -346,10 +384,10 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
     og_t = soup.find("meta", property="og:title")
     og_d = soup.find("meta", property="og:description")
     og_i = soup.find("meta", property="og:image")
-    pd["og_tags"]              = "Present" if og_t else "Missing"
-    pd["og_title_current"]     = _clean(og_t.get("content", "")) if og_t else "Missing"
-    pd["og_description_current"] = _clean(og_d.get("content", "")) if og_d else "Missing"
-    pd["og_image_current"]     = og_i.get("content", "Missing") if og_i else "Missing"
+    pd["og_tags"]                 = "Present" if og_t else "Missing"
+    pd["og_title_current"]        = _clean(og_t.get("content", "")) if og_t else "Missing"
+    pd["og_description_current"]  = _clean(og_d.get("content", "")) if og_d else "Missing"
+    pd["og_image_current"]        = og_i.get("content", "Missing") if og_i else "Missing"
 
     # Schema
     schema_types = []
@@ -362,7 +400,7 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
                     if isinstance(item, dict): schema_types.append(item.get("@type", "Unknown"))
         except Exception:
             pass
-    pd["schema_markup"]     = "Present" if schema_types else "Missing"
+    pd["schema_markup"]      = "Present" if schema_types else "Missing"
     pd["schema_types_found"] = ", ".join(schema_types) if schema_types else "None"
 
     # Hreflang
@@ -389,16 +427,16 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
         })
     with images_lock:
         images_list.extend(page_imgs)
-    pd["total_images"]      = img_total
+    pd["total_images"]       = img_total
     pd["images_missing_alt"] = img_missing
-    pd["image_alt_status"]  = (
+    pd["image_alt_status"]   = (
         "All Present" if img_missing == 0 and img_total > 0
         else f"{img_missing}/{img_total} Missing" if img_total > 0
         else "No Images"
     )
 
-    # Technical
-    pd["viewport_configured"] = "Yes" if soup.find("meta", attrs={"name":"viewport"}) else "No"
+    # Technical checks
+    pd["viewport_configured"] = "Yes" if soup.find("meta", attrs={"name": "viewport"}) else "No"
     pd["html_size_kb"]        = round(len(html_text) / 1024, 1)
     pd["html_size_issue"]     = "Yes" if pd["html_size_kb"] > 100 else "No"
     pd["is_secure"]           = "Yes" if url.startswith("https://") else "No"
@@ -414,43 +452,80 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
     pd["mixed_content_details"] = " | ".join(mixed[:10])
 
     unmin_js = [
-        sc.get("src","")[:100]
+        sc.get("src", "")[:100]
         for sc in soup.find_all("script")
-        if sc.get("src","") and ".min." not in sc.get("src","")
-        and not any(c in sc.get("src","") for c in ["cdn.","cdnjs.","googleapis."])
+        if sc.get("src", "") and ".min." not in sc.get("src", "")
+        and not any(c in sc.get("src", "") for c in ["cdn.", "cdnjs.", "googleapis.", "gstatic."])
     ]
     pd["unminified_js"]         = "Yes" if unmin_js else "No"
     pd["unminified_js_details"] = " | ".join(unmin_js[:5])
 
     unmin_css = [
-        lk.get("href","")[:100]
+        lk.get("href", "")[:100]
         for lk in soup.find_all("link", rel="stylesheet")
-        if lk.get("href","") and ".min." not in lk.get("href","")
-        and not any(c in lk.get("href","") for c in ["cdn.","cdnjs.","googleapis."])
+        if lk.get("href", "") and ".min." not in lk.get("href", "")
+        and not any(c in lk.get("href", "") for c in ["cdn.", "cdnjs.", "googleapis.", "gstatic."])
     ]
     pd["unminified_css"]         = "Yes" if unmin_css else "No"
     pd["unminified_css_details"] = " | ".join(unmin_css[:5])
 
     amp = soup.find("link", rel="amphtml")
-    pd["amp_link"] = amp.get("href","Present") if amp else "None"
+    pd["amp_link"] = amp.get("href", "Present") if amp else "None"
 
+    # OG Validation
     og_issues = []
     if not og_t: og_issues.append("Missing og:title")
+    elif len(og_t.get("content", "")) > 90: og_issues.append(f"og:title too long ({len(og_t.get('content',''))} chars)")
     if not og_d: og_issues.append("Missing og:description")
     if not og_i: og_issues.append("Missing og:image")
     if not soup.find("meta", property="og:url"):  og_issues.append("Missing og:url")
     if not soup.find("meta", property="og:type"): og_issues.append("Missing og:type")
     pd["og_validation"] = " | ".join(og_issues) if og_issues else "Valid"
 
-    x_robots = response_headers.get("X-Robots-Tag", response_headers.get("x-robots-tag",""))
-    pd["x_robots_noindex"]  = "Yes" if "noindex" in x_robots.lower() else "No"
+    x_robots = response_headers.get("X-Robots-Tag", response_headers.get("x-robots-tag", ""))
+    pd["x_robots_noindex"]   = "Yes" if "noindex" in x_robots.lower() else "No"
     pd["page_cache_control"] = response_headers.get("Cache-Control",
-                               response_headers.get("cache-control","Not Set"))
+                               response_headers.get("cache-control", "Not Set"))
 
-    pd["spam_malware_flags"] = "Clean"
-    pd["_content"] = text_content[:5000]  # Keep for AI, trimmed to control memory
+    # Spam / Malware detection
+    spam_flags = []
+    text_lower = text_content.lower()
+    page_source_lower = page_source.lower()
+    spam_markers = [
+        ("viagra", "Pharmaceutical spam"), ("cialis", "Pharmaceutical spam"),
+        ("casino", "Casino/gambling spam"), ("poker online", "Gambling spam"),
+        ("buy cheap", "Spam commercial content"), ("payday loan", "Financial spam"),
+        ("cryptocurrency invest", "Crypto spam"), ("click here to win", "Phishing/spam"),
+    ]
+    for marker, label in spam_markers:
+        idx = text_lower.find(marker)
+        if idx >= 0:
+            start = max(0, idx - 40)
+            end = min(len(text_content), idx + len(marker) + 40)
+            context = text_content[start:end].strip()
+            spam_flags.append(f"{label} — found: ...{context}...")
+    hidden_patterns = [
+        ('display:none', 'display:none'), ('visibility:hidden', 'visibility:hidden'),
+        ('font-size:0', 'font-size:0'), ('text-indent:-9999', 'text-indent off-screen'),
+        ('position:absolute;left:-9999', 'off-screen positioning'),
+    ]
+    for hp, hp_label in hidden_patterns:
+        if hp.replace(" ", "") in page_source_lower.replace(" ", ""):
+            spam_flags.append(f"Hidden text/cloaking ({hp_label})")
+    if "eval(atob(" in page_source_lower or "eval(base64_decode" in page_source_lower:
+        spam_flags.append("Base64 encoded script execution - possible malware")
+    pd["spam_malware_flags"] = " | ".join(spam_flags) if spam_flags else "Clean"
+
+    # Store content for AI (trimmed for memory)
+    pd["_content"] = text_content[:5000]
 
     # Discover internal links
+    domain_variants = {domain}
+    if domain.startswith("www."):
+        domain_variants.add(domain[4:])
+    else:
+        domain_variants.add("www." + domain)
+
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if href.startswith(("javascript:", "mailto:", "tel:", "#")):
@@ -461,7 +536,7 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
             continue
         with broken_lock:
             pending_links.append((url, full))
-        if urlparse(full).netloc == domain:
+        if urlparse(full).netloc in domain_variants:
             path_lower = urlparse(full).path.lower()
             is_asset = (
                 any(path_lower.endswith(ext) for ext in SKIP_EXTENSIONS) or
@@ -534,17 +609,22 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     logger.info(f"Files: robots={robots_status} sitemap={sitemap_status} "
                 f"llm={llm_status} gbp={gbp_status}")
 
+    # SSL + WWW checks (site-level, stored in audit final update)
+    ssl_status        = _check_ssl(domain)
+    www_resolve       = _check_www_resolve(base_url, domain)
+    sitemap_size      = _check_sitemap_size(domain)
+
     # State
-    visited         = set()
-    pages_list      = []
-    images_list     = []
+    visited          = set()
+    pages_list       = []
+    images_list      = []
     broken_links_list = []
-    pending_links   = []
+    pending_links    = []
     content_hash_map = {}
-    crawl_depth_map = {}
-    pages_lock      = Lock()
-    images_lock     = Lock()
-    broken_lock     = Lock()
+    crawl_depth_map  = {}
+    pages_lock       = Lock()
+    images_lock      = Lock()
+    broken_lock      = Lock()
 
     # ── BFS Crawl ─────────────────────────────────────────────────────────────
     logger.info(f"Starting crawl (limit={crawl_limit})...")
@@ -627,18 +707,17 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     logger.info(f"Broken links: {len(broken_links_list)}")
 
     # ── Location detection ─────────────────────────────────────────────────────
-    detected_location = target_location or _detect_location(domain)
+    detected_location = target_location or _detect_location(domain, pages_list, ai_mode)
 
     # ── Save crawled pages to DB ───────────────────────────────────────────────
-    # Each page gets its own connection so one failure cannot cascade to others
     saved_pages = 0
     failed_pages = 0
     for p in pages_list:
         _conn = get_db_conn()
         try:
             db_insert_page(_conn, audit_id, p)
-            db_mark_url_progress(_conn, audit_id, p.get("url",""), "crawled",
-                                 str(p.get("status","")))
+            db_mark_url_progress(_conn, audit_id, p.get("url", ""), "crawled",
+                                 str(p.get("status", "")))
             saved_pages += 1
         except Exception as e:
             failed_pages += 1
@@ -680,21 +759,41 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
         _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespeed)
     else:
         for p in pages_list:
-            p["seo_score"] = _calculate_seo_score(p) if _is_200(p) else 0
-            p["seo_grade"] = _seo_grade(p["seo_score"])
-            # Update DB seo_score even when no AI
-            conn = get_db_conn()
+            if _is_200(p):
+                p["seo_score"] = _calculate_seo_score(p)
+                p["seo_grade"] = _seo_grade(p["seo_score"])
+            _conn = get_db_conn()
             try:
-                db_update_page_ai(conn, audit_id, p.get("url",""), p)
+                db_update_page_ai(_conn, audit_id, p.get("url", ""), p)
             except Exception: pass
             finally:
-                release_db_conn(conn)
+                release_db_conn(_conn)
+
+    # ── AI alt text for missing-ALT images ────────────────────────────────────
+    if ai_mode != "4":
+        from ai_helpers import ai_alt_recommendations
+        missing_imgs = [i for i in images_list if i.get("alt_status") == "Missing"]
+        if missing_imgs:
+            alt_recs = ai_alt_recommendations(missing_imgs)
+            for img in images_list:
+                if img.get("src") in alt_recs:
+                    img["ai_alt_recommendation"] = alt_recs[img["src"]]
+            # Update image records in DB
+            if alt_recs:
+                _conn = get_db_conn()
+                try:
+                    db_insert_images_batch(_conn, audit_id, images_list)
+                except Exception as e:
+                    logger.error(f"DB alt recs update error: {e}")
+                finally:
+                    release_db_conn(_conn)
 
     # ── Site-wide AI ───────────────────────────────────────────────────────────
     site_recommendation_text = ""
     keyword_data = {}; blog_topics_data = []; backlink_strategy_data = {}
     six_month_plan_data = {}; internal_linking_data = {}
     keyword_url_map_data = []; axo_data = {}
+    new_page_suggestions = []
 
     if ai_mode != "4":
         from ai_helpers import (
@@ -710,6 +809,10 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
             "robots_txt": robots_status, "sitemap": sitemap_status,
             "llm_txt": llm_status, "gbp": gbp_status,
             "detected_location": detected_location,
+            "thin_pages": len([p for p in pages_200 if p.get("thin_content") == "Yes"]),
+            "missing_schema": len([p for p in pages_200 if p.get("schema_markup") == "Missing"]),
+            "missing_og": len([p for p in pages_200 if p.get("og_tags") == "Missing"]),
+            "images_missing_alt": len([i for i in images_list if i.get("alt_status") == "Missing"]),
         }
         site_recommendation_text = ai_site_recommendations(domain, summary, pages_200)
 
@@ -727,14 +830,22 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
             plan_summary = {
                 "total_pages": len(pages_list), "pages_200": len(pages_200),
                 "broken_links": len(broken_links_list),
-                "thin_pages": len([p for p in pages_200 if p.get("thin_content")=="Yes"]),
-                "missing_schema": len([p for p in pages_200 if p.get("schema_markup")=="Missing"]),
+                "thin_pages": len([p for p in pages_200 if p.get("thin_content") == "Yes"]),
+                "missing_schema": len([p for p in pages_200 if p.get("schema_markup") == "Missing"]),
+                "blog_topics_count": sum(len(s.get("topics", [])) for s in blog_topics_data),
             }
-            six_month_plan_data    = ai_six_month_plan(keyword_data, backlink_strategy_data,
+            six_month_plan_data   = ai_six_month_plan(keyword_data, backlink_strategy_data,
                                                         brand_name, domain, plan_summary)
-            internal_linking_data  = ai_internal_linking_strategy(pages_200, domain)
-            keyword_url_map_data   = ai_keyword_url_mapping(pages_200, keyword_data, domain, detected_location)
-            axo_data               = ai_axo_recommendations(pages_200, keyword_data, domain, detected_location)
+            internal_linking_data = ai_internal_linking_strategy(pages_200, domain)
+            keyword_url_map_data  = ai_keyword_url_mapping(pages_200, keyword_data, domain, detected_location)
+            axo_data              = ai_axo_recommendations(pages_200, keyword_data, domain, detected_location)
+
+            # New page suggestions
+            try:
+                from ai_helpers import ai_new_page_suggestions
+                new_page_suggestions = ai_new_page_suggestions(pages_200, keyword_data, domain, brand_name, detected_location)
+            except ImportError:
+                logger.warning("ai_new_page_suggestions not found in ai_helpers — skipping")
 
     # ── Scorecard ──────────────────────────────────────────────────────────────
     scorecard_results, global_checks = build_scorecard(
@@ -748,9 +859,8 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     # ── Generated SEO files ────────────────────────────────────────────────────
     generated_files = _generate_seo_files(base_url, domain, pages_list, broken_links_list)
 
-    # ── DB — save site-wide data (each table isolated so one failure doesn't stop others) ──
+    # ── DB — save site-wide data ───────────────────────────────────────────────
     def _safe_db_insert(label, func, *args):
-        """Insert with isolated connection so one failure doesn't cascade."""
         _c = get_db_conn()
         try:
             func(_c, *args)
@@ -763,17 +873,27 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
             release_db_conn(_c)
 
     logger.info(f"Saving site-wide data to DB (audit #{audit_id})...")
-    _safe_db_insert("scorecard",         db_insert_scorecard,         audit_id, scorecard_results, global_checks)
-    _safe_db_insert("aeo_faq",           db_insert_aeo_faq,           audit_id, pages_list)
-    _safe_db_insert("site_analysis",     db_insert_site_analysis,     audit_id, site_analysis_data)
-    _safe_db_insert("generated_files",   db_insert_generated_files,   audit_id, generated_files)
-    _safe_db_insert("seo_keywords",      db_insert_keywords,          audit_id, keyword_data)
-    _safe_db_insert("blog_topics",       db_insert_blog_topics,       audit_id, blog_topics_data)
-    _safe_db_insert("backlink_strategies",db_insert_backlinks,        audit_id, backlink_strategy_data)
-    _safe_db_insert("six_month_plan",    db_insert_plan,              audit_id, six_month_plan_data)
-    _safe_db_insert("internal_linking",  db_insert_internal_linking,  audit_id, internal_linking_data)
-    _safe_db_insert("keyword_url_map",   db_insert_kw_url_map,        audit_id, keyword_url_map_data)
-    _safe_db_insert("axo_recommendations",db_insert_axo,              audit_id, axo_data)
+    _safe_db_insert("scorecard",           db_insert_scorecard,        audit_id, scorecard_results, global_checks)
+    _safe_db_insert("aeo_faq",             db_insert_aeo_faq,          audit_id, pages_list)
+    _safe_db_insert("site_analysis",       db_insert_site_analysis,    audit_id, site_analysis_data)
+    _safe_db_insert("generated_files",     db_insert_generated_files,  audit_id, generated_files)
+    _safe_db_insert("seo_keywords",        db_insert_keywords,         audit_id, keyword_data)
+    _safe_db_insert("blog_topics",         db_insert_blog_topics,      audit_id, blog_topics_data)
+    _safe_db_insert("backlink_strategies", db_insert_backlinks,        audit_id, backlink_strategy_data)
+    _safe_db_insert("six_month_plan",      db_insert_plan,             audit_id, six_month_plan_data)
+    _safe_db_insert("internal_linking",    db_insert_internal_linking, audit_id, internal_linking_data)
+    _safe_db_insert("keyword_url_map",     db_insert_kw_url_map,       audit_id, keyword_url_map_data)
+    _safe_db_insert("axo_recommendations", db_insert_axo,              audit_id, axo_data)
+
+    # New page suggestions (optional table)
+    if new_page_suggestions:
+        try:
+            from db import db_insert_new_page_suggestions
+            _safe_db_insert("new_page_suggestions", db_insert_new_page_suggestions,
+                            audit_id, new_page_suggestions)
+        except ImportError:
+            logger.warning("db_insert_new_page_suggestions not in db.py — skipping")
+
     logger.info("All site-wide DB saves complete.")
 
     # ── Excel & PDF exports ────────────────────────────────────────────────────
@@ -814,16 +934,23 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     conn = get_db_conn()
     try:
         db_update_audit_complete(conn, audit_id, {
-            "total_pages": len(pages_list),
-            "pages_200":   len(pages_200),
-            "pages_404":   len([p for p in pages_list if _is_404(p)]),
-            "broken_links": len(broken_links_list),
+            "total_pages":       len(pages_list),
+            "pages_200":         len(pages_200),
+            "pages_404":         len([p for p in pages_list if _is_404(p)]),
+            "broken_links":      len(broken_links_list),
             "images_missing_alt": len([i for i in images_list if i.get("alt_status") == "Missing"]),
-            "robots_status": robots_status, "sitemap_status": sitemap_status,
-            "llm_status": llm_status, "gbp_status": gbp_status,
+            "robots_status":     robots_status,
+            "sitemap_status":    sitemap_status,
+            "llm_status":        llm_status,
+            "gbp_status":        gbp_status,
             "site_recommendation": site_recommendation_text,
             "detected_location": detected_location,
-            "excel_file": excel_file, "pdf_file": pdf_file,
+            "business_type":     keyword_data.get("business_type", ""),
+            "ssl_status":        ssl_status,
+            "www_resolve":       www_resolve,
+            "sitemap_size":      sitemap_size,
+            "excel_file":        excel_file,
+            "pdf_file":          pdf_file,
         })
     finally:
         release_db_conn(conn)
@@ -835,7 +962,7 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
 # ── Per-page AI analysis ──────────────────────────────────────────────────────
 
 def _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespeed):
-    from ai_helpers import ai_analysis, ai_aeo_faq
+    from ai_helpers import ai_analysis, ai_aeo_faq, ai_body_copy_guidance
     from db import get_db_conn, release_db_conn, db_update_page_ai, db_mark_url_progress
 
     total = len(pages_200)
@@ -847,32 +974,32 @@ def _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespe
         try:
             with ThreadPoolExecutor(max_workers=3) as sub:
                 ai_f   = sub.submit(ai_analysis, url,
-                                    pd.get("current_title",""),
-                                    pd.get("current_meta_description",""),
-                                    pd.get("current_h1",""), content)
+                                    pd.get("current_title", ""),
+                                    pd.get("current_meta_description", ""),
+                                    pd.get("current_h1", ""), content)
                 mob_f  = sub.submit(_get_pagespeed, url, "mobile")  if run_pagespeed else None
                 desk_f = sub.submit(_get_pagespeed, url, "desktop") if run_pagespeed else None
 
                 ai      = ai_f.result(timeout=120) or {}
-                mobile  = mob_f.result(timeout=120)  if mob_f  else {"score":"N/A","lcp":"N/A","cls":"N/A","fcp":"N/A"}
-                desktop = desk_f.result(timeout=120) if desk_f else {"score":"N/A","lcp":"N/A","cls":"N/A","fcp":"N/A"}
+                mobile  = mob_f.result(timeout=120)  if mob_f  else {"score": "N/A", "lcp": "N/A", "cls": "N/A", "fcp": "N/A"}
+                desktop = desk_f.result(timeout=120) if desk_f else {"score": "N/A", "lcp": "N/A", "cls": "N/A", "fcp": "N/A"}
 
             pd.update({
-                "primary_keyword":      ai.get("primary_keyword", ""),
-                "secondary_keywords":   ", ".join(ai.get("secondary_keywords", [])),
-                "short_tail_keywords":  ", ".join(ai.get("short_tail_keywords", [])),
-                "long_tail_keywords":   ", ".join(ai.get("long_tail_keywords", [])),
-                "ai_meta_title":        ai.get("meta_title", ""),
-                "ai_meta_description":  ai.get("meta_description", ""),
-                "ai_h1":                ai.get("h1", ""),
-                "ai_og_title":          ai.get("og_title", ""),
-                "ai_og_description":    ai.get("og_description", ""),
-                "ai_og_image_url":      ai.get("og_image_url", ""),
+                "primary_keyword":          ai.get("primary_keyword", ""),
+                "secondary_keywords":       ", ".join(ai.get("secondary_keywords", [])),
+                "short_tail_keywords":      ", ".join(ai.get("short_tail_keywords", [])),
+                "long_tail_keywords":       ", ".join(ai.get("long_tail_keywords", [])),
+                "ai_meta_title":            ai.get("meta_title", ""),
+                "ai_meta_description":      ai.get("meta_description", ""),
+                "ai_h1":                    ai.get("h1", ""),
+                "ai_og_title":              ai.get("og_title", ""),
+                "ai_og_description":        ai.get("og_description", ""),
+                "ai_og_image_url":          ai.get("og_image_url", ""),
                 "ai_schema_recommendation": ai.get("schema_type", ""),
                 "ai_schema_code_snippet":   ai.get("schema_code_snippet", ""),
-                "ai_optimized_url":     ai.get("optimized_url", ""),
-                "image_optimization_tips": ai.get("image_optimization_tips", ""),
-                "serp_preview": _serp_preview(url, ai.get("meta_title",""), ai.get("meta_description","")),
+                "ai_optimized_url":         ai.get("optimized_url", ""),
+                "image_optimization_tips":  ai.get("image_optimization_tips", ""),
+                "serp_preview": _serp_preview(url, ai.get("meta_title", ""), ai.get("meta_description", "")),
                 "mobile_score":  str(mobile.get("score",  "N/A")),
                 "mobile_lcp":    str(mobile.get("lcp",    "N/A")),
                 "mobile_cls":    str(mobile.get("cls",    "N/A")),
@@ -883,14 +1010,24 @@ def _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespe
                 "desktop_fcp":   str(desktop.get("fcp",   "N/A")),
             })
 
+            # AEO FAQ + body copy guidance — first 50 pages only (cost control)
             if idx < 50:
-                faq = ai_aeo_faq(url, pd.get("current_title",""),
-                                 pd.get("current_h1",""), content,
-                                 pd.get("primary_keyword",""), detected_location)
+                faq = ai_aeo_faq(url, pd.get("current_title", ""),
+                                 pd.get("current_h1", ""), content,
+                                 pd.get("primary_keyword", ""), detected_location)
                 pd["aeo_faq"]       = json.dumps(faq) if faq else ""
                 pd["_aeo_faq_list"] = faq or []
+
+                body_guidance = ai_body_copy_guidance(
+                    url, pd.get("current_title", ""), pd.get("current_h1", ""),
+                    content, pd.get("primary_keyword", ""),
+                    pd.get("word_count", 0), detected_location
+                )
+                pd["body_copy_guidance"] = json.dumps(body_guidance) if body_guidance else ""
             else:
-                pd["aeo_faq"] = ""; pd["_aeo_faq_list"] = []
+                pd["aeo_faq"]            = ""
+                pd["_aeo_faq_list"]      = []
+                pd["body_copy_guidance"] = ""
 
             pd["seo_score"] = _calculate_seo_score(pd)
             pd["seo_grade"] = _seo_grade(pd["seo_score"])
@@ -903,7 +1040,7 @@ def _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespe
         conn = get_db_conn()
         try:
             db_update_page_ai(conn, audit_id, url, pd)
-            db_mark_url_progress(conn, audit_id, url, "analyzed", str(pd.get("status","")))
+            db_mark_url_progress(conn, audit_id, url, "analyzed", str(pd.get("status", "")))
         except Exception as e:
             logger.error(f"DB update error {url}: {e}")
         finally:
@@ -946,8 +1083,9 @@ def _check_gbp(base_url: str) -> str:
     try:
         r = _safe_get(base_url, timeout=12)
         if r.status_code == 200:
-            markers = ["google.com/maps","maps.google.com","goo.gl/maps",
-                       "business.google.com","LocalBusiness","schema.org/LocalBusiness"]
+            markers = ["google.com/maps", "maps.google.com", "goo.gl/maps",
+                       "business.google.com", "LocalBusiness", "schema.org/LocalBusiness",
+                       "google.com/maps/place"]
             if any(m in r.text for m in markers):
                 return "Present"
     except Exception:
@@ -955,40 +1093,229 @@ def _check_gbp(base_url: str) -> str:
     return "Not Found"
 
 
-def _detect_location(domain: str) -> str:
+def _check_ssl(domain: str) -> str:
+    """Check SSL certificate validity and expiry days."""
+    try:
+        import ssl, socket
+        clean_host = domain.replace("www.", "") if not domain.startswith("www.") else domain
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.socket(), server_hostname=clean_host) as s:
+            s.settimeout(10)
+            s.connect((clean_host, 443))
+            cert = s.getpeercert()
+            exp = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+            days = (exp - datetime.now()).days
+            if days < 0:
+                return f"EXPIRED ({abs(days)} days ago)"
+            elif days < 30:
+                return f"Expiring soon ({days} days)"
+            else:
+                return f"Valid ({days} days remaining)"
+    except Exception as e:
+        return f"Check failed: {str(e)[:50]}"
+
+
+def _check_www_resolve(base_url: str, domain: str) -> str:
+    """Check that www and non-www both resolve to the same canonical URL."""
+    try:
+        if domain.startswith("www."):
+            non_www = domain[4:]
+            r = _safe_get(f"https://{non_www}/", timeout=10)
+            if r.url.replace("http://", "https://").rstrip("/") != base_url.rstrip("/"):
+                return f"Non-www does not redirect to www ({r.url})"
+        else:
+            r = _safe_get(f"https://www.{domain}/", timeout=10)
+            if r.url.replace("http://", "https://").rstrip("/") != base_url.rstrip("/"):
+                return f"www does not redirect to non-www ({r.url})"
+        return "OK"
+    except Exception:
+        return "Could not test"
+
+
+def _check_sitemap_size(domain: str) -> str:
+    """Return sitemap size status string."""
+    try:
+        r = _safe_get(f"https://{domain}/sitemap.xml", timeout=12)
+        if r.status_code == 200:
+            size_kb = round(len(r.content) / 1024, 1)
+            if size_kb > 50000:
+                return f"Too large ({size_kb} KB — max 50MB)"
+            elif size_kb > 10000:
+                return f"Large ({size_kb} KB — consider splitting)"
+            else:
+                return f"OK ({size_kb} KB)"
+    except Exception:
+        pass
+    return "Could not check"
+
+
+def _detect_location(domain: str, pages_list: list = None, ai_mode: str = "4") -> str:
+    """Detect target location from TLD or AI analysis of page content."""
     tld_map = {
         ".uk": "United Kingdom", ".co.uk": "United Kingdom",
         ".au": "Australia", ".ca": "Canada", ".in": "India",
         ".de": "Germany", ".fr": "France", ".sg": "Singapore",
         ".ae": "UAE", ".nz": "New Zealand", ".za": "South Africa",
+        ".ie": "Ireland", ".nl": "Netherlands", ".it": "Italy",
+        ".es": "Spain", ".jp": "Japan", ".br": "Brazil", ".mx": "Mexico",
     }
     for tld, loc in tld_map.items():
         if domain.endswith(tld):
             return loc
+
+    # Try AI detection if enabled and pages available
+    if ai_mode != "4" and pages_list:
+        try:
+            from ai_helpers import ai_chat
+            loc_sample = " ".join(
+                f"{p.get('current_title','')} {p.get('current_meta_description','')}"
+                for p in pages_list[:20] if _is_200(p)
+            )[:3000]
+            if loc_sample.strip():
+                prompt = ("From this website content, identify the PRIMARY COUNTRY this business "
+                          "operates in or targets. Return COUNTRY name only. If unclear, return 'Global'.\n\n"
+                          f"Content: {loc_sample}")
+                result = ai_chat(prompt, max_tokens=50, temperature=0.1).strip().strip('"').strip("'")
+                if result and result.lower() != "global":
+                    return result
+        except Exception:
+            pass
     return "Global"
 
 
 def _build_site_analysis(pages_list, sitemap_urls):
+    """Build comprehensive site analysis: HTTP status, crawl depth, hreflang, sitemap comparison."""
     data = []
+
+    # HTTP Status Distribution
     status_counts = {}
     for p in pages_list:
         st = str(p.get("status", "Unknown"))
-        key = st if st in ("200","301","302","404") else ("5xx" if st.startswith("5") else "Other")
+        if st.startswith("200"): key = "200"
+        elif st == "301": key = "301"
+        elif st == "302": key = "302"
+        elif st == "404": key = "404"
+        elif st.startswith("5"): key = "5xx"
+        elif any(st.startswith(x) for x in ["Error", "Connection", "Timeout"]): key = "Error"
+        else: key = st
         status_counts[key] = status_counts.get(key, 0) + 1
     for code, count in sorted(status_counts.items()):
-        data.append({"type":"http_status","key":code,"value":f"{count} pages","count":count})
+        data.append({"type": "http_status", "key": code, "value": f"{count} pages", "count": count})
+
+    # Crawl Depth Distribution
+    depth_counts = {}
+    for p in pages_list:
+        d = p.get("crawl_depth", -1)
+        key = str(d) if d >= 0 else "Unknown"
+        depth_counts[key] = depth_counts.get(key, 0) + 1
+    for depth, count in sorted(depth_counts.items(),
+                               key=lambda x: (x[0] == "Unknown", int(x[0]) if x[0].isdigit() else 999)):
+        data.append({"type": "crawl_depth", "key": depth, "value": f"{count} pages", "count": count})
+
+    # Hreflang Summary
+    hreflang_pages = [p for p in pages_list if p.get("hreflang_tags")]
+    hreflang_langs = {}
+    for p in hreflang_pages:
+        for part in (p.get("hreflang_tags", "")).split(" | "):
+            if ":" in part:
+                lang = part.split(":")[0].strip()
+                hreflang_langs[lang] = hreflang_langs.get(lang, 0) + 1
+    data.append({"type": "hreflang_summary", "key": "total_pages_with_hreflang",
+                 "value": str(len(hreflang_pages)), "count": len(hreflang_pages)})
+    data.append({"type": "hreflang_summary", "key": "total_languages",
+                 "value": str(len(hreflang_langs)), "count": len(hreflang_langs)})
+    for lang, count in sorted(hreflang_langs.items()):
+        data.append({"type": "hreflang_lang", "key": lang, "value": f"{count} pages", "count": count})
+
+    # Sitemap vs Crawled Pages comparison
+    crawled_norm = {p.get("url", "").rstrip("/").lower() for p in pages_list if p.get("url")}
+    sitemap_norm = {u.rstrip("/").lower() for u in sitemap_urls}
+    in_both         = crawled_norm & sitemap_norm
+    in_sitemap_only = sitemap_norm - crawled_norm
+    in_crawl_only   = crawled_norm - sitemap_norm
+    data.append({"type": "sitemap_comparison", "key": "sitemap_total",  "value": str(len(sitemap_norm)),  "count": len(sitemap_norm)})
+    data.append({"type": "sitemap_comparison", "key": "crawled_total",  "value": str(len(crawled_norm)),  "count": len(crawled_norm)})
+    data.append({"type": "sitemap_comparison", "key": "in_both",        "value": str(len(in_both)),       "count": len(in_both)})
+    data.append({"type": "sitemap_comparison", "key": "sitemap_only",   "value": str(len(in_sitemap_only)),"count": len(in_sitemap_only)})
+    data.append({"type": "sitemap_comparison", "key": "crawl_only",     "value": str(len(in_crawl_only)), "count": len(in_crawl_only)})
+    for u in list(in_sitemap_only)[:100]:
+        data.append({"type": "sitemap_only_url", "key": "url", "value": u, "count": 0})
+    for u in list(in_crawl_only)[:100]:
+        data.append({"type": "crawl_only_url", "key": "url", "value": u, "count": 0})
+
     return data
 
 
 def _generate_seo_files(base_url, domain, pages_list, broken_links):
+    """Generate sitemap.xml, robots.txt, llms.txt, .htaccess, nginx redirects, broken link report."""
     files = []
-    urls = [p["url"] for p in pages_list if _is_200(p)]
+    urls_200 = [p["url"] for p in pages_list if _is_200(p) and p.get("url")]
+
+    # sitemap.xml
     xml = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-    for u in urls:
+    for u in urls_200:
         xml += f'  <url><loc>{u}</loc></url>\n'
     xml += '</urlset>'
-    files.append({"file_name":"sitemap.xml","file_type":"application/xml","file_content":xml,"file_size":len(xml.encode())})
+    files.append({"file_name": "sitemap.xml", "file_type": "application/xml",
+                  "file_content": xml, "file_size": len(xml.encode())})
 
+    # robots.txt
     robots = f"User-agent: *\nAllow: /\n\nSitemap: {base_url.rstrip('/')}/sitemap.xml\n"
-    files.append({"file_name":"robots.txt","file_type":"text/plain","file_content":robots,"file_size":len(robots.encode())})
+    files.append({"file_name": "robots.txt", "file_type": "text/plain",
+                  "file_content": robots, "file_size": len(robots.encode())})
+
+    # llms.txt
+    brand = domain.replace("www.", "").split(".")[0].title()
+    keywords = set()
+    for p in pages_list:
+        if p.get("primary_keyword"):
+            keywords.add(p["primary_keyword"])
+    llms = f"# {brand}\n\n## About\n{brand} is a business at {base_url}\n\n## Services\n"
+    for kw in list(keywords)[:20]:
+        llms += f"- {kw}\n"
+    llms += f"\n## Contact\nWebsite: {base_url}\n"
+    files.append({"file_name": "llms.txt", "file_type": "text/plain",
+                  "file_content": llms, "file_size": len(llms.encode())})
+
+    # .htaccess
+    htaccess = "# AquilTechLabs SEO .htaccess\nRewriteEngine On\n\n"
+    htaccess += "# Force HTTPS\nRewriteCond %{HTTPS} off\nRewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]\n\n"
+    if domain.startswith("www."):
+        htaccess += "# Force www\nRewriteCond %{HTTP_HOST} !^www\\.\nRewriteRule ^(.*)$ https://www.%{HTTP_HOST}/$1 [L,R=301]\n\n"
+    htaccess += "# Remove trailing slash\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule ^(.*)/$ /$1 [L,R=301]\n\n"
+    htaccess += "<IfModule mod_deflate.c>\nAddOutputFilterByType DEFLATE text/html text/css application/javascript\n</IfModule>\n\n"
+    htaccess += "<IfModule mod_expires.c>\nExpiresActive On\nExpiresByType image/jpeg \"access plus 1 year\"\nExpiresByType image/png \"access plus 1 year\"\nExpiresByType text/css \"access plus 1 month\"\nExpiresByType application/javascript \"access plus 1 month\"\n</IfModule>\n"
+    files.append({"file_name": ".htaccess", "file_type": "text/plain",
+                  "file_content": htaccess, "file_size": len(htaccess.encode())})
+
+    # .htaccess_redirects
+    redirects_ht = "# Broken link redirects (auto-generated)\n"
+    for bl in broken_links[:200]:
+        broken_path = urlparse(bl.get("broken_url", "")).path or "/"
+        target = bl.get("redirect_suggestion", base_url) or base_url
+        target_path = urlparse(target).path or "/"
+        if broken_path != target_path:
+            redirects_ht += f"Redirect 301 {broken_path} {target}\n"
+    files.append({"file_name": ".htaccess_redirects", "file_type": "text/plain",
+                  "file_content": redirects_ht, "file_size": len(redirects_ht.encode())})
+
+    # nginx_redirects.conf
+    redirects_ng = "# Nginx broken link redirects\n"
+    for bl in broken_links[:200]:
+        broken_path = urlparse(bl.get("broken_url", "")).path or "/"
+        target_path = urlparse(bl.get("redirect_suggestion", "/") or "/").path or "/"
+        if broken_path != target_path:
+            redirects_ng += f"rewrite ^{broken_path}$ {target_path} permanent;\n"
+    files.append({"file_name": "nginx_redirects.conf", "file_type": "text/plain",
+                  "file_content": redirects_ng, "file_size": len(redirects_ng.encode())})
+
+    # broken_links_report.txt
+    report = f"Broken Links Report — {domain}\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+    for bl in broken_links:
+        report += f"SOURCE: {bl.get('source_page','')}\n  BROKEN: {bl.get('broken_url','')} ({bl.get('status','')})\n  SUGGEST: {bl.get('redirect_suggestion','')}\n\n"
+    if not broken_links:
+        report += "No broken links found.\n"
+    files.append({"file_name": "broken_links_report.txt", "file_type": "text/plain",
+                  "file_content": report, "file_size": len(report.encode())})
+
     return files

@@ -817,6 +817,52 @@ def db_insert_generated_files(conn, audit_id: int, files: list):
     conn.commit()
 
 
+ 
+DB_ADDITION = '''
+ 
+def db_insert_new_page_suggestions(conn, audit_id: int, suggestions: list):
+    """Insert AI-generated new page suggestions."""
+    if not suggestions:
+        return
+    with conn.cursor() as cur:
+        # Create table if it doesn't exist yet
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS new_page_suggestions (
+                id               SERIAL PRIMARY KEY,
+                audit_id         INTEGER REFERENCES audits(id) ON DELETE CASCADE,
+                suggested_url    TEXT,
+                page_title       TEXT,
+                page_type        TEXT,
+                reason           TEXT,
+                target_keyword   TEXT,
+                content_outline  TEXT,
+                priority         TEXT DEFAULT \'medium\',
+                created_at       TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        rows = [
+            (
+                audit_id,
+                s.get("url", "")[:2000],
+                s.get("title", "")[:500],
+                s.get("page_type", "")[:100],
+                s.get("reason", "")[:2000],
+                s.get("target_keyword", "")[:500],
+                json.dumps(s.get("content_outline", []))[:5000],
+                s.get("priority", "medium")[:20],
+            )
+            for s in suggestions
+        ]
+        execute_values(cur, """
+            INSERT INTO new_page_suggestions
+                (audit_id, suggested_url, page_title, page_type, reason,
+                 target_keyword, content_outline, priority)
+            VALUES %s
+        """, rows)
+    conn.commit()
+    logger.info(f"Inserted {len(suggestions)} new page suggestions for audit #{audit_id}")
+'''   
+
 def db_mark_url_progress(conn, audit_id: int, url: str, phase: str, status_code: str = ""):
     with conn.cursor() as cur:
         cur.execute("""
