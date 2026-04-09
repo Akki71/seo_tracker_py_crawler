@@ -553,7 +553,7 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
 # ── Main Orchestrator ─────────────────────────────────────────────────────────
 
 def run_audit(input_url: str, brand_id: int, target_location: str = "",
-              ai_mode: str = "1", crawl_limit: int = 100,
+              business_type: str = "", ai_mode: str = "1", crawl_limit: int = 100,
               run_pagespeed: bool = False) -> dict:
     """
     Entry point called by the API background task.
@@ -594,6 +594,7 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
         audit_id = db_create_audit(conn, brand_id, {
             "domain": domain, "base_url": base_url,
             "target_location": target_location or "Global",
+            "business_type": business_type or "",
             "ai_mode": ai_mode,
         })
     finally:
@@ -882,7 +883,7 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     _safe_db_insert("backlink_strategies", db_insert_backlinks,        audit_id, backlink_strategy_data)
     _safe_db_insert("six_month_plan",      db_insert_plan,             audit_id, six_month_plan_data)
     _safe_db_insert("internal_linking",    db_insert_internal_linking, audit_id, internal_linking_data)
-    _safe_db_insert("keyword_url_map",     db_insert_kw_url_map,       audit_id, keyword_url_map_data)
+    _safe_db_insert("keyword_url_mappping",     db_insert_kw_url_map,       audit_id, keyword_url_map_data)
     _safe_db_insert("axo_recommendations", db_insert_axo,              audit_id, axo_data)
 
     # New page suggestions (optional table)

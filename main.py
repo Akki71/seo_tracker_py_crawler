@@ -58,8 +58,10 @@ app = FastAPI(
 class AuditRequest(BaseModel):
     url: str
     brand_id: int
+    domain: Optional[str] = ""          # optional override; auto-detected from url if blank
     target_location: Optional[str] = ""
-    ai_mode: Optional[str] = "1"       # 1=OpenAI 2=Claude 3=Hybrid 4=Skip AI
+    business_type: Optional[str] = ""   # e.g. "agency", "ecommerce", "saas", "local"
+    ai_mode: Optional[str] = "1"        # 1=OpenAI 2=Claude 3=Hybrid 4=Skip AI
     crawl_limit: Optional[int] = 100
     run_pagespeed: Optional[bool] = False
 
@@ -179,17 +181,18 @@ async def start_audit(req: AuditRequest, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(
         _run_audit_task,
-        job_id        = job_id,
-        url           = url,
-        brand_id      = req.brand_id,
+        job_id          = job_id,
+        url             = url,
+        brand_id        = req.brand_id,
         target_location = req.target_location or "",
-        ai_mode       = req.ai_mode or "1",
-        crawl_limit   = crawl_limit,
-        run_pagespeed = bool(req.run_pagespeed),
+        business_type   = req.business_type or "",
+        ai_mode         = req.ai_mode or "1",
+        crawl_limit     = crawl_limit,
+        run_pagespeed   = bool(req.run_pagespeed),
     )
 
     logger.info(f"[{job_id}] Queued: brand={req.brand_id} url={url} "
-                f"ai={req.ai_mode} limit={crawl_limit}")
+                f"ai={req.ai_mode} limit={crawl_limit} biz={req.business_type}")
 
     return AuditStatusResponse(job_id=job_id, **{
         k: v for k, v in jobs[job_id].items()
@@ -302,7 +305,7 @@ def _get_job_or_404(job_id: str) -> dict:
 # ── Background Task ────────────────────────────────────────────────────────────
 
 def _run_audit_task(job_id, url, brand_id, target_location,
-                    ai_mode, crawl_limit, run_pagespeed):
+                    business_type, ai_mode, crawl_limit, run_pagespeed):
     """Runs the full audit. All imports happen here — never at module level."""
     jobs[job_id]["status"]  = "running"
     jobs[job_id]["message"] = "Crawl in progress..."
@@ -316,6 +319,7 @@ def _run_audit_task(job_id, url, brand_id, target_location,
             input_url       = url,
             brand_id        = brand_id,
             target_location = target_location,
+            business_type   = business_type,
             ai_mode         = ai_mode,
             crawl_limit     = crawl_limit,
             run_pagespeed   = run_pagespeed,

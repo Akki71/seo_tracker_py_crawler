@@ -31,10 +31,33 @@ def _get_pool() -> pg_pool.SimpleConnectionPool:
     return _pool
 
 def get_db_conn():
-    return _get_pool().getconn()
+    """Get a connection from pool. Resets broken pool automatically."""
+    global _pool
+    try:
+        conn = _get_pool().getconn()
+        # Test connection is alive
+        conn.cursor().execute("SELECT 1")
+        return conn
+    except Exception:
+        # Pool is stale — close all and recreate
+        logger.warning("DB pool connection stale — resetting pool...")
+        try:
+            if _pool:
+                _pool.closeall()
+        except Exception:
+            pass
+        _pool = None
+        conn = _get_pool().getconn()
+        return conn
 
 def release_db_conn(conn):
-    _get_pool().putconn(conn)
+    try:
+        # Reset any broken transaction before returning to pool
+        if conn.closed == 0:
+            conn.rollback()
+        _get_pool().putconn(conn)
+    except Exception as e:
+        logger.warning(f"release_db_conn error (ignored): {e}")
 
 def close_pool():
     global _pool
@@ -449,6 +472,8 @@ def db_create_audit(conn, brand_id: int, audit_meta: dict) -> int:
 
 
 def db_update_audit_complete(conn, audit_id: int, stats: dict):
+    # Ensure new columns exist (safe migration)
+    _ensure_audit_columns(conn)
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE audits SET
@@ -457,6 +482,8 @@ def db_update_audit_complete(conn, audit_id: int, stats: dict):
                 robots_txt_status   = %s, sitemap_status = %s,
                 llm_txt_status      = %s, gbp_status = %s,
                 site_recommendation = %s, detected_location = %s,
+                business_type       = %s,
+                ssl_status          = %s, www_resolve = %s, sitemap_size = %s,
                 excel_file          = %s, pdf_file = %s,
                 audit_status        = 'complete'
             WHERE id = %s
@@ -468,10 +495,40 @@ def db_update_audit_complete(conn, audit_id: int, stats: dict):
             stats.get("llm_status", ""), stats.get("gbp_status", ""),
             stats.get("site_recommendation", "")[:60000],
             stats.get("detected_location", ""),
+            stats.get("business_type", ""),
+            stats.get("ssl_status", ""), stats.get("www_resolve", ""),
+            stats.get("sitemap_size", ""),
             stats.get("excel_file", ""), stats.get("pdf_file", ""),
             audit_id,
         ))
     conn.commit()
+
+
+def _ensure_audit_columns(conn):
+    """Add any missing columns to audits table (one-time safe migration)."""
+    extra_cols = [
+        ("business_type", "TEXT"),
+        ("ssl_status",    "TEXT"),
+        ("www_resolve",   "TEXT"),
+        ("sitemap_size",  "TEXT"),
+    ]
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name='audits' AND table_schema='public'
+            """)
+            existing = {r[0] for r in cur.fetchall()}
+        for col, coltype in extra_cols:
+            if col not in existing:
+                with conn.cursor() as cur:
+                    cur.execute(f"ALTER TABLE audits ADD COLUMN IF NOT EXISTS {col} {coltype}")
+                conn.commit()
+                logger.info(f"Migration: added audits.{col}")
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        logger.warning(f"_ensure_audit_columns error (non-fatal): {e}")
 
 
 def _safe(val, max_len=10000):
