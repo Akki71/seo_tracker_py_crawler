@@ -6,8 +6,9 @@ All DB_CONFIG values are read from environment variables (set in Coolify).
 
 import os, json, logging
 from typing import Optional
+import time
 import psycopg2
-from psycopg2 import pool as pg_pool
+import psycopg2.extensions
 from psycopg2.extras import execute_values
 
 logger = logging.getLogger(__name__)
@@ -21,49 +22,68 @@ DB_CONFIG = {
     "dbname":   os.environ.get("DB_NAME", "seo_crawler"),
 }
 
-_pool = None  # type: Optional[pg_pool.SimpleConnectionPool]
+# ── Connection layer — direct connect with retry (no pool) ────────────────────
+# SimpleConnectionPool is NOT used because Coolify/Postgres kills idle connections
+# server-side (idle timeout, TCP timeout) without notifying the pool.
+# Direct connections with keepalives + retry are far more reliable.
 
-def _get_pool() -> pg_pool.SimpleConnectionPool:
-    global _pool
-    if _pool is None:
-        _pool = pg_pool.SimpleConnectionPool(minconn=1, maxconn=10, **DB_CONFIG)
-        logger.info("PostgreSQL connection pool created.")
-    return _pool
+_CONNECT_KWARGS = None  # built once from DB_CONFIG
 
-def get_db_conn():
-    """Get a connection from pool. Resets broken pool automatically."""
-    global _pool
-    try:
-        conn = _get_pool().getconn()
-        # Test connection is alive
-        conn.cursor().execute("SELECT 1")
-        return conn
-    except Exception:
-        # Pool is stale — close all and recreate
-        logger.warning("DB pool connection stale — resetting pool...")
+def _connect_kwargs() -> dict:
+    global _CONNECT_KWARGS
+    if _CONNECT_KWARGS is None:
+        _CONNECT_KWARGS = {
+            **DB_CONFIG,
+            "connect_timeout":            10,
+            "keepalives":                 1,
+            "keepalives_idle":            30,   # send keepalive after 30s idle
+            "keepalives_interval":        10,   # retry every 10s
+            "keepalives_count":           5,    # drop after 5 missed keepalives
+            "options":                    "-c statement_timeout=300000",  # 5 min max query
+        }
+    return _CONNECT_KWARGS
+
+
+def _new_conn() -> psycopg2.extensions.connection:
+    """Open a fresh direct connection (not from pool)."""
+    conn = psycopg2.connect(**_connect_kwargs())
+    conn.autocommit = False
+    return conn
+
+
+def get_db_conn() -> psycopg2.extensions.connection:
+    """
+    Return a working psycopg2 connection.
+    Tries up to 3 times with exponential back-off so transient
+    Postgres restarts / Coolify container recycles don't crash the audit.
+    """
+    import time
+    last_err = None
+    for attempt in range(1, 4):
         try:
-            if _pool:
-                _pool.closeall()
-        except Exception:
-            pass
-        _pool = None
-        conn = _get_pool().getconn()
-        return conn
+            conn = _new_conn()
+            conn.cursor().execute("SELECT 1")   # verify it's alive
+            return conn
+        except Exception as e:
+            last_err = e
+            wait = attempt * 2          # 2s, 4s, 6s
+            logger.warning(f"DB connect attempt {attempt}/3 failed: {e} — retrying in {wait}s")
+            time.sleep(wait)
+    raise psycopg2.OperationalError(f"Could not connect to PostgreSQL after 3 attempts: {last_err}")
+
 
 def release_db_conn(conn):
+    """Close the connection (no pool to return to)."""
     try:
-        # Reset any broken transaction before returning to pool
-        if conn.closed == 0:
-            conn.rollback()
-        _get_pool().putconn(conn)
+        if conn and not conn.closed:
+            conn.close()
     except Exception as e:
-        logger.warning(f"release_db_conn error (ignored): {e}")
+        logger.debug(f"release_db_conn close error (ignored): {e}")
+
 
 def close_pool():
-    global _pool
-    if _pool:
-        _pool.closeall()
-        _pool = None
+    """No-op — kept for API compatibility."""
+    pass
 
 # ── Schema Creation ────────────────────────────────────────────────────────────
 
@@ -213,14 +233,19 @@ CREATE TABLE IF NOT EXISTS seo_keywords (
 
 -- Blog topics
 CREATE TABLE IF NOT EXISTS blog_topics (
-    id              SERIAL PRIMARY KEY,
-    audit_id        INTEGER REFERENCES audits(id) ON DELETE CASCADE,
-    service_name    TEXT,
-    title           TEXT,
-    topic_type      TEXT,
-    target_keyword  TEXT,
-    description     TEXT,
-    created_at      TIMESTAMP DEFAULT NOW()
+    id                   SERIAL PRIMARY KEY,
+    audit_id             INTEGER REFERENCES audits(id) ON DELETE CASCADE,
+    service_name         TEXT,
+    title                TEXT,
+    topic_type           TEXT,
+    target_keyword       TEXT,
+    description          TEXT,
+    blog_content         TEXT,
+    primary_keyword      TEXT,
+    secondary_keywords   TEXT,
+    short_tail_keywords  TEXT,
+    long_tail_keywords   TEXT,
+    created_at           TIMESTAMP DEFAULT NOW()
 );
 
 -- Backlink strategies
@@ -359,6 +384,94 @@ CREATE INDEX IF NOT EXISTS idx_pages_url          ON pages(url);
 CREATE INDEX IF NOT EXISTS idx_broken_audit_id    ON broken_links(audit_id);
 CREATE INDEX IF NOT EXISTS idx_images_audit_id    ON images(audit_id);
 CREATE INDEX IF NOT EXISTS idx_progress_audit_url ON audit_progress(audit_id, url);
+
+-- Keyword planner (100 keywords with search volume, CPC, competition)
+CREATE TABLE IF NOT EXISTS keyword_planner (
+    id                  SERIAL PRIMARY KEY,
+    audit_id            INTEGER REFERENCES audits(id) ON DELETE CASCADE,
+    keyword             TEXT,
+    keyword_type        TEXT,
+    keyword_category    TEXT,
+    competition_level   TEXT,
+    search_volume       INTEGER DEFAULT 0,
+    cpc                 NUMERIC(10,2) DEFAULT 0.00,
+    competition_index   NUMERIC(5,4) DEFAULT 0.0000,
+    is_brand_keyword    BOOLEAN DEFAULT FALSE,
+    service_name        TEXT,
+    keyword_rank        INTEGER DEFAULT 0,
+    keyword_difficulty  TEXT,
+    intent              TEXT,
+    mapped_url          TEXT,
+    created_at          TIMESTAMP DEFAULT NOW()
+);
+
+-- Schema markup analysis (per-page deep schema analysis)
+CREATE TABLE IF NOT EXISTS schema_markup_analysis (
+    id                  SERIAL PRIMARY KEY,
+    audit_id            INTEGER REFERENCES audits(id) ON DELETE CASCADE,
+    page_url            TEXT,
+    schema_types_found  TEXT,
+    schema_snippets     TEXT,
+    recommended_schemas TEXT,
+    recommended_snippets TEXT,
+    schema_status       TEXT,
+    missing_schemas     TEXT,
+    validation_errors   TEXT,
+    created_at          TIMESTAMP DEFAULT NOW()
+);
+
+-- LLM prompts (AI engine prompts with keyword targeting)
+CREATE TABLE IF NOT EXISTS llm_prompts (
+    id              SERIAL PRIMARY KEY,
+    audit_id        INTEGER REFERENCES audits(id) ON DELETE CASCADE,
+    prompt_text     TEXT,
+    prompt_type     TEXT,
+    target_keyword  TEXT,
+    search_volume   INTEGER DEFAULT 0,
+    ai_engine       TEXT,
+    suggested_answer TEXT,
+    service_name    TEXT,
+    mapped_url      TEXT,
+    priority        TEXT DEFAULT 'medium',
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- Depth analysis (per-page crawl depth records)
+CREATE TABLE IF NOT EXISTS depth_analysis (
+    id                    SERIAL PRIMARY KEY,
+    audit_id              INTEGER REFERENCES audits(id) ON DELETE CASCADE,
+    depth_level           INTEGER DEFAULT 0,
+    page_url              TEXT,
+    page_title            TEXT,
+    parent_url            TEXT,
+    seo_score             INTEGER DEFAULT 0,
+    status_code           TEXT,
+    word_count            INTEGER DEFAULT 0,
+    has_schema            BOOLEAN DEFAULT FALSE,
+    internal_links_count  INTEGER DEFAULT 0,
+    created_at            TIMESTAMP DEFAULT NOW()
+);
+
+-- New page suggestions
+CREATE TABLE IF NOT EXISTS new_page_suggestions (
+    id               SERIAL PRIMARY KEY,
+    audit_id         INTEGER REFERENCES audits(id) ON DELETE CASCADE,
+    suggested_url    TEXT,
+    page_title       TEXT,
+    page_type        TEXT,
+    reason           TEXT,
+    target_keyword   TEXT,
+    content_outline  TEXT,
+    priority         TEXT DEFAULT 'medium',
+    created_at       TIMESTAMP DEFAULT NOW()
+);
+
+-- Additional indexes
+CREATE INDEX IF NOT EXISTS idx_keyword_planner_audit  ON keyword_planner(audit_id);
+CREATE INDEX IF NOT EXISTS idx_schema_analysis_audit  ON schema_markup_analysis(audit_id);
+CREATE INDEX IF NOT EXISTS idx_llm_prompts_audit       ON llm_prompts(audit_id);
+CREATE INDEX IF NOT EXISTS idx_depth_analysis_audit    ON depth_analysis(audit_id);
+CREATE INDEX IF NOT EXISTS idx_new_page_sugg_audit     ON new_page_suggestions(audit_id);
 """
 
 # All columns the pages table MUST have (column_name, column_definition)
@@ -395,21 +508,93 @@ AUDITS_REQUIRED_COLUMNS = [
     ("gbp_status",           "TEXT"),
 ]
 
+# blog_topics was created before these columns existed — migrate them in
+BLOG_TOPICS_REQUIRED_COLUMNS = [
+    ("blog_content",         "TEXT"),
+    ("primary_keyword",      "TEXT"),
+    ("secondary_keywords",   "TEXT"),
+    ("short_tail_keywords",  "TEXT"),
+    ("long_tail_keywords",   "TEXT"),
+]
+
+
+
+def _fix_serial_sequences(conn):
+    """Ensure all id columns that should be SERIAL have proper sequences attached.
+    This fixes tables created from MySQL dumps that land without auto-increment."""
+    tables = [
+        "audits", "pages", "broken_links", "images", "seo_keywords",
+        "blog_topics", "backlink_strategies", "six_month_plan", "internal_linking",
+        "keyword_url_mapping", "axo_recommendations", "scorecard", "aeo_faq",
+        "audit_progress", "site_analysis", "generated_files",
+        "keyword_planner", "schema_markup_analysis", "llm_prompts",
+        "depth_analysis", "new_page_suggestions",
+    ]
+    for table in tables:
+        try:
+            with conn.cursor() as cur:
+                # Check if id column exists and if it already has a default
+                cur.execute("""
+                    SELECT column_default FROM information_schema.columns
+                    WHERE table_name = %s AND column_name = 'id' AND table_schema = 'public'
+                """, (table,))
+                row = cur.fetchone()
+                if row and (row[0] is None or 'nextval' not in str(row[0])):
+                    # id exists but has no sequence — create and attach one
+                    seq_name = f"{table}_id_seq"
+                    cur.execute(f"CREATE SEQUENCE IF NOT EXISTS {seq_name}")
+                    cur.execute(f"""
+                        SELECT setval('{seq_name}',
+                            COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)
+                    """)
+                    cur.execute(f"""
+                        ALTER TABLE {table}
+                        ALTER COLUMN id SET DEFAULT nextval('{seq_name}')
+                    """)
+                    conn.commit()
+                    logger.info(f"Fixed SERIAL sequence for {table}.id")
+        except Exception as e:
+            try: conn.rollback()
+            except Exception: pass
+            logger.debug(f"_fix_serial_sequences {table}: {str(e)[:80]}")
+
 
 def init_db():
-    """Create all tables, then run ALTER TABLE migrations for any missing columns."""
+    """
+    Create all tables one statement at a time to avoid SSL/timeout drops
+    on large CREATE_TABLES_SQL batches. Each statement gets its own commit.
+    """
     conn = get_db_conn()
     try:
-        # Step 1: Create tables (idempotent)
-        with conn.cursor() as cur:
-            cur.execute(CREATE_TABLES_SQL)
-        conn.commit()
+        _sql_kw = ("CREATE", "ALTER", "INSERT", "DROP", "GRANT")
+        executed = 0
+        for raw_stmt in CREATE_TABLES_SQL.split(";"):
+            # Strip comment lines, get clean SQL
+            lines = [l for l in raw_stmt.splitlines() if not l.strip().startswith("--")]
+            stmt = "\n".join(lines).strip()
+            if not stmt or not any(stmt.upper().startswith(k) for k in _sql_kw):
+                continue
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(stmt)
+                conn.commit()
+                executed += 1
+            except Exception as stmt_err:
+                try: conn.rollback()
+                except Exception: pass
+                logger.debug(f"DDL skipped (already exists?): {str(stmt_err)[:80]}")
 
-        # Step 2: Add any missing columns to existing tables (safe migration)
-        _migrate_columns(conn, "pages",  PAGES_REQUIRED_COLUMNS)
-        _migrate_columns(conn, "audits", AUDITS_REQUIRED_COLUMNS)
+        logger.info(f"init_db: {executed} DDL statements executed OK")
 
-        logger.info("PostgreSQL schema initialized.")
+        # Safe column migrations
+        _migrate_columns(conn, "pages",       PAGES_REQUIRED_COLUMNS)
+        _migrate_columns(conn, "audits",      AUDITS_REQUIRED_COLUMNS)
+        _migrate_columns(conn, "blog_topics", BLOG_TOPICS_REQUIRED_COLUMNS)
+
+        # Fix any tables that may have been created without SERIAL sequences
+        _fix_serial_sequences(conn)
+
+        logger.info("PostgreSQL schema initialized ✓")
     except Exception as e:
         try: conn.rollback()
         except Exception: pass
@@ -452,23 +637,36 @@ def _migrate_columns(conn, table: str, required_cols: list):
 # ── DB Helper Functions ────────────────────────────────────────────────────────
 
 def db_create_audit(conn, brand_id: int, audit_meta: dict) -> int:
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO audits (brand_id, domain, base_url, target_location,
-                business_type, ai_mode, audit_status)
-            VALUES (%s,%s,%s,%s,%s,%s,'in_progress')
-            RETURNING id
-        """, (
-            brand_id,
-            audit_meta.get("domain", ""),
-            audit_meta.get("base_url", ""),
-            audit_meta.get("target_location", "Global"),
-            audit_meta.get("business_type", ""),
-            audit_meta.get("ai_mode", "1"),
-        ))
-        audit_id = cur.fetchone()[0]
-    conn.commit()
-    return audit_id
+    """Insert audit row. Retries with a fresh connection on OperationalError."""
+    def _do(c):
+        with c.cursor() as cur:
+            cur.execute("""
+                INSERT INTO audits (brand_id, domain, base_url, target_location,
+                    business_type, ai_mode, audit_status)
+                VALUES (%s,%s,%s,%s,%s,%s,'in_progress')
+                RETURNING id
+            """, (
+                brand_id,
+                audit_meta.get("domain", ""),
+                audit_meta.get("base_url", ""),
+                audit_meta.get("target_location", "Global"),
+                audit_meta.get("business_type", ""),
+                audit_meta.get("ai_mode", "1"),
+            ))
+            audit_id = cur.fetchone()[0]
+        c.commit()
+        return audit_id
+
+    try:
+        return _do(conn)
+    except psycopg2.OperationalError:
+        logger.warning("db_create_audit: connection lost — reconnecting...")
+        release_db_conn(conn)
+        fresh = get_db_conn()
+        try:
+            return _do(fresh)
+        finally:
+            release_db_conn(fresh)
 
 
 def db_update_audit_complete(conn, audit_id: int, stats: dict):
@@ -698,15 +896,33 @@ def db_insert_blog_topics(conn, audit_id: int, blog_data: list):
     rows = []
     for svc in blog_data:
         for t in svc.get("topics", []):
-            rows.append((audit_id, svc.get("service",""), t.get("title",""),
-                         t.get("type",""), t.get("target_keyword",""), t.get("description","")))
+            secondary = t.get("secondary_keywords", [])
+            short_tail = t.get("short_tail_keywords", [])
+            long_tail  = t.get("long_tail_keywords", [])
+            rows.append((
+                audit_id,
+                str(svc.get("service", ""))[:255],
+                str(t.get("title", ""))[:2000],
+                str(t.get("type", ""))[:50],
+                str(t.get("target_keyword", ""))[:500],
+                str(t.get("description", ""))[:5000],
+                str(t.get("blog_content", ""))[:60000],
+                str(t.get("primary_keyword", ""))[:500],
+                ", ".join(secondary) if isinstance(secondary, list) else str(secondary),
+                ", ".join(short_tail) if isinstance(short_tail, list) else str(short_tail),
+                ", ".join(long_tail)  if isinstance(long_tail, list)  else str(long_tail),
+            ))
     if rows:
         with conn.cursor() as cur:
             execute_values(cur, """
-                INSERT INTO blog_topics (audit_id, service_name, title, topic_type, target_keyword, description)
+                INSERT INTO blog_topics
+                    (audit_id, service_name, title, topic_type, target_keyword,
+                     description, blog_content, primary_keyword,
+                     secondary_keywords, short_tail_keywords, long_tail_keywords)
                 VALUES %s
             """, rows)
         conn.commit()
+        logger.info(f"  db_insert_blog_topics: inserted {len(rows)} topics for audit #{audit_id}")
 
 
 def db_insert_backlinks(conn, audit_id: int, bl_data: dict):
@@ -775,11 +991,21 @@ def db_insert_internal_linking(conn, audit_id: int, il_data: dict):
 def db_insert_kw_url_map(conn, audit_id: int, kum_data: list):
     if not kum_data:
         return
-    rows = [(audit_id, k.get("keyword",""), k.get("keyword_type",""),
-             k.get("service",""), k.get("mapped_url",""),
-             k.get("match_confidence",""), k.get("reason",""),
-             k.get("on_page_action",""), bool(k.get("create_new_page")),
-             k.get("suggested_new_url","")) for k in kum_data]
+    rows = []
+    for k in kum_data:
+        service = k.get("service_name") or k.get("service") or ""
+        rows.append((
+            audit_id,
+            str(k.get("keyword", ""))[:500],
+            str(k.get("keyword_type", ""))[:100],
+            str(service)[:255],
+            str(k.get("mapped_url", ""))[:2000],
+            str(k.get("match_confidence", ""))[:50],
+            str(k.get("reason", ""))[:2000],
+            str(k.get("on_page_action", ""))[:2000],
+            bool(k.get("create_new_page", False)),
+            str(k.get("suggested_new_url", ""))[:2000],
+        ))
     with conn.cursor() as cur:
         execute_values(cur, """
             INSERT INTO keyword_url_mapping (audit_id, keyword, keyword_type, service_name,
@@ -788,6 +1014,7 @@ def db_insert_kw_url_map(conn, audit_id: int, kum_data: list):
             VALUES %s
         """, rows)
     conn.commit()
+    logger.info(f"keyword_url_mapping: inserted {len(rows)} rows for audit {audit_id}")
 
 
 def db_insert_axo(conn, audit_id: int, axo_data: dict):
@@ -875,41 +1102,28 @@ def db_insert_generated_files(conn, audit_id: int, files: list):
 
 
  
-DB_ADDITION = '''
- 
+
+
 def db_insert_new_page_suggestions(conn, audit_id: int, suggestions: list):
     """Insert AI-generated new page suggestions."""
     if not suggestions:
         return
+    rows = []
+    for s in suggestions:
+        outline = s.get("content_outline", [])
+        rows.append((
+            audit_id,
+            str(s.get("url", s.get("suggested_url", "")))[:2000],
+            str(s.get("title", s.get("page_title", "")))[:500],
+            str(s.get("page_type", ""))[:100],
+            str(s.get("reason", ""))[:2000],
+            str(s.get("target_keyword", ""))[:500],
+            json.dumps(outline) if isinstance(outline, list) else str(outline)[:5000],
+            str(s.get("priority", "medium"))[:20],
+        ))
+    if not rows:
+        return
     with conn.cursor() as cur:
-        # Create table if it doesn't exist yet
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS new_page_suggestions (
-                id               SERIAL PRIMARY KEY,
-                audit_id         INTEGER REFERENCES audits(id) ON DELETE CASCADE,
-                suggested_url    TEXT,
-                page_title       TEXT,
-                page_type        TEXT,
-                reason           TEXT,
-                target_keyword   TEXT,
-                content_outline  TEXT,
-                priority         TEXT DEFAULT \'medium\',
-                created_at       TIMESTAMP DEFAULT NOW()
-            );
-        """)
-        rows = [
-            (
-                audit_id,
-                s.get("url", "")[:2000],
-                s.get("title", "")[:500],
-                s.get("page_type", "")[:100],
-                s.get("reason", "")[:2000],
-                s.get("target_keyword", "")[:500],
-                json.dumps(s.get("content_outline", []))[:5000],
-                s.get("priority", "medium")[:20],
-            )
-            for s in suggestions
-        ]
         execute_values(cur, """
             INSERT INTO new_page_suggestions
                 (audit_id, suggested_url, page_title, page_type, reason,
@@ -917,8 +1131,216 @@ def db_insert_new_page_suggestions(conn, audit_id: int, suggestions: list):
             VALUES %s
         """, rows)
     conn.commit()
-    logger.info(f"Inserted {len(suggestions)} new page suggestions for audit #{audit_id}")
-'''   
+    logger.info(f"Inserted {len(rows)} new page suggestions for audit #{audit_id}")
+
+
+def db_insert_keyword_planner(conn, audit_id: int, keywords_ranked: list):
+    """Insert keyword planner data (100 keywords with search volume, CPC, competition)."""
+    if not keywords_ranked:
+        return
+    rows = [
+        (
+            audit_id,
+            str(k.get("keyword", ""))[:500],
+            str(k.get("keyword_type", ""))[:50],
+            str(k.get("keyword_category", ""))[:100],
+            str(k.get("competition_level", ""))[:20],
+            int(k.get("search_volume", 0) or 0),
+            float(k.get("cpc", 0.0) or 0.0),
+            float(k.get("competition_index", 0.0) or 0.0),
+            bool(k.get("is_brand_keyword", False)),
+            str(k.get("service_name", ""))[:255],
+            int(k.get("keyword_rank", 0) or 0),
+            str(k.get("keyword_difficulty", ""))[:20],
+            str(k.get("intent", ""))[:50],
+            str(k.get("mapped_url", ""))[:2000],
+        )
+        for k in keywords_ranked
+    ]
+    # Use ON CONFLICT DO NOTHING to handle duplicate id sequences gracefully
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO keyword_planner
+                    (audit_id, keyword, keyword_type, keyword_category, competition_level,
+                     search_volume, cpc, competition_index, is_brand_keyword, service_name,
+                     keyword_rank, keyword_difficulty, intent, mapped_url)
+                VALUES %s
+                ON CONFLICT (id) DO NOTHING
+            """, rows)
+        conn.commit()
+        logger.info(f"keyword_planner: inserted {len(rows)} keywords for audit #{audit_id}")
+    except Exception as _ke:
+        try: conn.rollback()
+        except Exception: pass
+        logger.warning(f"keyword_planner batch failed ({_ke}) — trying row-by-row")
+        inserted = 0
+        for row in rows:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO keyword_planner
+                            (audit_id, keyword, keyword_type, keyword_category, competition_level,
+                             search_volume, cpc, competition_index, is_brand_keyword, service_name,
+                             keyword_rank, keyword_difficulty, intent, mapped_url)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT DO NOTHING
+                    """, row)
+                conn.commit()
+                inserted += 1
+            except Exception as _re:
+                try: conn.rollback()
+                except Exception: pass
+                logger.error(f"keyword_planner row error: {_re}")
+        logger.info(f"keyword_planner: row-by-row inserted {inserted}/{len(rows)} for audit #{audit_id}")
+
+
+def db_insert_schema_analysis(conn, audit_id: int, schema_results: list):
+    """Insert per-page schema markup deep analysis."""
+    if not schema_results:
+        return
+
+    def _jdump(val):
+        if isinstance(val, (list, dict)):
+            return json.dumps(val, default=str)[:10000]
+        return str(val or "")[:10000]
+
+    rows = []
+    for sr in schema_results:
+        if not sr or not sr.get("page_url"):
+            continue
+        rows.append((
+            audit_id,
+            str(sr.get("page_url", ""))[:2000],
+            _jdump(sr.get("schema_types_found", [])),
+            _jdump(sr.get("schema_snippets", [])),
+            _jdump(sr.get("recommended_schemas", [])),
+            _jdump(sr.get("recommended_snippets", [])),
+            str(sr.get("schema_status", ""))[:50],
+            _jdump(sr.get("missing_schemas", [])),
+            "",  # validation_errors
+        ))
+    if not rows:
+        return
+    inserted = 0
+    for row in rows:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO schema_markup_analysis
+                        (audit_id, page_url, schema_types_found, schema_snippets,
+                         recommended_schemas, recommended_snippets, schema_status,
+                         missing_schemas, validation_errors)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, row)
+            conn.commit()
+            inserted += 1
+        except Exception as row_err:
+            try: conn.rollback()
+            except Exception: pass
+            logger.error(f"schema_markup_analysis row insert error: {row_err}")
+    logger.info(f"schema_markup_analysis: inserted {inserted}/{len(rows)} pages for audit #{audit_id}")
+
+
+def db_insert_llm_prompts(conn, audit_id: int, prompts: list):
+    """Insert LLM prompts (AI engine question prompts with keyword data)."""
+    if not prompts:
+        return
+    rows = [
+        (
+            audit_id,
+            str(p.get("prompt_text", ""))[:5000],
+            str(p.get("prompt_type", ""))[:50],
+            str(p.get("target_keyword", ""))[:500],
+            int(p.get("search_volume", 0) or 0),
+            str(p.get("ai_engine", ""))[:100],
+            str(p.get("suggested_answer", ""))[:10000],
+            str(p.get("service_name", ""))[:255],
+            str(p.get("mapped_url", ""))[:2000],
+            str(p.get("priority", "medium"))[:20],
+        )
+        for p in prompts
+    ]
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO llm_prompts
+                (audit_id, prompt_text, prompt_type, target_keyword, search_volume,
+                 ai_engine, suggested_answer, service_name, mapped_url, priority)
+            VALUES %s
+        """, rows)
+    conn.commit()
+    logger.info(f"llm_prompts: inserted {len(rows)} prompts for audit #{audit_id}")
+
+
+def db_insert_depth_analysis(conn, audit_id: int, depth_records: list):
+    """Insert per-page crawl depth analysis records."""
+    if not depth_records:
+        return
+    rows = []
+    for d in depth_records:
+        if not d.get("page_url"):
+            continue
+        rows.append((
+            audit_id,
+            int(d.get("depth_level", 0) or 0),
+            str(d.get("page_url", ""))[:2000],
+            str(d.get("page_title") or "")[:500],
+            str(d.get("parent_url") or "")[:2000],
+            int(d.get("seo_score", 0) or 0),
+            str(d.get("status_code") or "")[:50],
+            int(d.get("word_count", 0) or 0),
+            bool(d.get("has_schema", False)),
+            int(d.get("internal_links_count", 0) or 0),
+        ))
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO depth_analysis
+                (audit_id, depth_level, page_url, page_title, parent_url,
+                 seo_score, status_code, word_count, has_schema, internal_links_count)
+            VALUES %s
+        """, rows)
+    conn.commit()
+    logger.info(f"depth_analysis: inserted {len(rows)} records for audit #{audit_id}")
+
+
+def db_insert_blog_topics_full(conn, audit_id: int, blog_data: list):
+    """Enhanced blog topics insert with full keyword fields (primary, secondary, etc.)."""
+    if not blog_data:
+        return
+    rows = []
+    for svc in blog_data:
+        for t in svc.get("topics", []):
+            secondary = t.get("secondary_keywords", [])
+            short_tail = t.get("short_tail_keywords", [])
+            long_tail  = t.get("long_tail_keywords", [])
+            rows.append((
+                audit_id,
+                str(svc.get("service", ""))[:255],
+                str(t.get("title", ""))[:2000],
+                str(t.get("type", ""))[:50],
+                str(t.get("target_keyword", ""))[:500],
+                str(t.get("description", ""))[:5000],
+                str(t.get("blog_content", ""))[:60000],
+                str(t.get("primary_keyword", ""))[:500],
+                ", ".join(secondary) if isinstance(secondary, list) else str(secondary),
+                ", ".join(short_tail) if isinstance(short_tail, list) else str(short_tail),
+                ", ".join(long_tail)  if isinstance(long_tail, list)  else str(long_tail),
+            ))
+    if rows:
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO blog_topics
+                    (audit_id, service_name, title, topic_type, target_keyword,
+                     description, blog_content, primary_keyword,
+                     secondary_keywords, short_tail_keywords, long_tail_keywords)
+                VALUES %s
+            """, rows)
+        conn.commit()
+        logger.info(f"blog_topics (full): inserted {len(rows)} topics for audit #{audit_id}")
+
+
 
 def db_mark_url_progress(conn, audit_id: int, url: str, phase: str, status_code: str = ""):
     with conn.cursor() as cur:

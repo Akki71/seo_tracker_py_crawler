@@ -68,6 +68,12 @@ def _has_client() -> bool:
 
 def ai_chat(prompt: str, max_tokens: int = 1024, temperature: float = 0.3,
             use_sonnet: bool = False) -> str:
+    """Universal AI call with automatic fallback.
+    mode=1: OpenAI only
+    mode=2: Claude only
+    mode=3: Hybrid — Claude Sonnet for strategy, GPT-4o-mini for bulk.
+            If Anthropic fails (credit/rate limit), automatically falls back to OpenAI.
+    """
     if not _has_client():
         return ""
     try:
@@ -82,7 +88,6 @@ def ai_chat(prompt: str, max_tokens: int = 1024, temperature: float = 0.3,
 
         elif _ai_mode == "2":
             if not anthropic_client: return ""
-            import anthropic as _ant
             r = anthropic_client.messages.create(
                 model=CLAUDE_SONNET if use_sonnet else CLAUDE_HAIKU,
                 max_tokens=max_tokens,
@@ -92,14 +97,26 @@ def ai_chat(prompt: str, max_tokens: int = 1024, temperature: float = 0.3,
             return r.content[0].text if r.content else ""
 
         elif _ai_mode == "3":
+            # Hybrid: Anthropic for strategy (use_sonnet=True), OpenAI for bulk
             if use_sonnet and anthropic_client:
-                import anthropic as _ant
-                r = anthropic_client.messages.create(
-                    model=CLAUDE_SONNET, max_tokens=max_tokens,
-                    messages=[{"role":"user","content":prompt}],
-                    temperature=temperature,
-                )
-                return r.content[0].text if r.content else ""
+                try:
+                    r = anthropic_client.messages.create(
+                        model=CLAUDE_SONNET, max_tokens=max_tokens,
+                        messages=[{"role":"user","content":prompt}],
+                        temperature=temperature,
+                    )
+                    return r.content[0].text if r.content else ""
+                except Exception as _ant_err:
+                    # Anthropic unavailable (credit/rate limit) — fall back to OpenAI
+                    logger.warning(f"Anthropic unavailable: {str(_ant_err)[:100]} — using OpenAI fallback")
+                    if openai_client:
+                        r = openai_client.chat.completions.create(
+                            model=GPT4O_MINI,
+                            messages=[{"role":"user","content":prompt}],
+                            temperature=temperature, max_tokens=max_tokens,
+                        )
+                        return r.choices[0].message.content or ""
+                    return ""
             elif openai_client:
                 r = openai_client.chat.completions.create(
                     model=GPT4O_MINI,
@@ -276,21 +293,38 @@ Pages:{ps}"""
 
 
 def ai_keyword_url_mapping(pages, kw_data, domain, location="Global") -> list:
+    """Map every keyword to its best matching page. Returns one row per keyword."""
     if not _has_client() or not pages: return []
     ps = "\n".join(
         f"- {p.get('url','')} | {p.get('current_title','')} | words:{p.get('word_count',0)}"
-        for p in pages[:20]
+        for p in pages[:50]
     )
-    kw = json.dumps([{"service":s.get("service",""),"primary":s.get("primary",""),
-                       "short_tail":s.get("short_tail",[]),"long_tail":s.get("long_tail",[])}
-                      for s in kw_data.get("services",[])], default=str)[:2000]
-    prompt = f"""SEO keyword mapping expert. Return ONLY JSON array (no markdown):
-[{{"keyword":"kw","keyword_type":"primary|secondary|short_tail|long_tail","service":"svc","mapped_url":"url","match_confidence":"High|Medium|Low","reason":"why","on_page_action":"action","create_new_page":false,"suggested_new_url":""}}]
+    # Flatten ALL keywords across all services
+    all_kw_rows = []
+    for s in kw_data.get("services", []):
+        svc = s.get("service", "")
+        for kw in [s.get("primary", "")] + s.get("keywords", []) + s.get("short_tail", []) + s.get("long_tail", []):
+            if kw:
+                ktype = "primary" if kw == s.get("primary") else "secondary"
+                all_kw_rows.append({"service": svc, "keyword": kw, "keyword_type": ktype})
+    if not all_kw_rows:
+        return []
+    kw_list = json.dumps(all_kw_rows[:60], default=str)
+    prompt = f"""SEO keyword-to-URL mapping expert.
+Map each keyword to the best existing page URL. Return ONLY a JSON array (no markdown):
+[{{"keyword":"kw","keyword_type":"primary|secondary|short_tail|long_tail","service_name":"service","mapped_url":"full_url","match_confidence":"High|Medium|Low","reason":"1 sentence why","on_page_action":"what to optimize on that page","create_new_page":false,"suggested_new_url":""}}]
+Rules: Every keyword must map to a URL. If no match, set create_new_page=true.
 Website:{domain} Location:{location}
-Pages:{ps}
-Keywords:{kw}"""
-    try: return _parse_arr(ai_chat(prompt, max_tokens=3000, temperature=0.3, use_sonnet=True))
-    except Exception as e: logger.error(f"ai_keyword_url_mapping: {e}"); return []
+Pages:
+{ps}
+Keywords: {kw_list}"""
+    try:
+        result = _parse_arr(ai_chat(prompt, max_tokens=4000, temperature=0.2, use_sonnet=True))
+        logger.info(f"ai_keyword_url_mapping: {len(result)} mappings generated")
+        return result
+    except Exception as e:
+        logger.error(f"ai_keyword_url_mapping: {e}")
+        return []
 
 
 def ai_axo_recommendations(pages, kw_data, domain, location="Global") -> dict:
@@ -326,10 +360,8 @@ Images:{img_list}"""
 
 
 
-AI_HELPERS_ADDITION = '''
- 
 def ai_new_page_suggestions(pages_data: list, keyword_data: dict,
-                             domain: str, brand: str, location: str = "Global") -> list:
+                              domain: str, brand: str, location: str = "Global") -> list:
     """Suggest NEW pages to create based on keyword gaps and site structure."""
     if not _has_client() or not pages_data:
         return []
@@ -338,20 +370,231 @@ def ai_new_page_suggestions(pages_data: list, keyword_data: dict,
     all_kws = []
     for svc in keyword_data.get("services", []):
         all_kws.extend(svc.get("keywords", [])[:5])
-    existing_list = "\\n".join(f"- {u}" for u in existing_urls[:30])
-    prompt = f"""SEO strategist. Suggest 5-10 NEW pages to create to fill SEO gaps.
-Return ONLY JSON array (no markdown):
-[{{"url":"/suggested-url-slug","title":"Page Title 30-60 chars","page_type":"service|location|blog|resource|landing","reason":"why needed","target_keyword":"main keyword","content_outline":["Section 1","Section 2","Section 3","Section 4","Section 5"],"priority":"high|medium|low"}}]
-Website:{domain} Brand:{brand} Location:{location}
-Services:{", ".join(services)}
-Keywords:{", ".join(all_kws[:15])}
-Existing pages:
-{existing_list}"""
+    existing_list = "\n".join(f"- {u}" for u in existing_urls[:30])
+    svc_str = ", ".join(services)
+    kw_str  = ", ".join(all_kws[:15])
+    prompt = (
+        f"SEO strategist. Suggest 5-10 NEW pages to create to fill SEO gaps.\n"
+        f"Return ONLY JSON array (no markdown):\n"
+        f'[{{"url":"/slug","title":"Title 30-60 chars","page_type":"service|location|blog|resource|landing",'
+        f'"reason":"why needed","target_keyword":"keyword","content_outline":["S1","S2","S3","S4","S5"],'
+        f'"priority":"high|medium|low"}}]\n'
+        f"Website:{domain} Brand:{brand} Location:{location}\n"
+        f"Services:{svc_str}\n"
+        f"Keywords:{kw_str}\n"
+        f"Existing pages:\n{existing_list}"
+    )
     try:
         result = _parse_arr(ai_chat(prompt, max_tokens=3000, temperature=0.4, use_sonnet=True))
-        logger.info(f"New page suggestions: {len(result)} pages recommended")
+        logger.info(f"ai_new_page_suggestions: {len(result)} pages recommended")
         return result if isinstance(result, list) else []
     except Exception as e:
         logger.error(f"ai_new_page_suggestions: {e}")
         return []
-'''
+
+
+
+def ai_keyword_planner_pipeline(keyword_data: dict, brand_name: str, location: str = "Global") -> list:
+    """
+    Generate 100 keywords with AI-estimated search volume, CPC, competition, intent.
+    Mirrors crawler_2.py keyword_planner_pipeline but uses AI estimation (no Google Ads required).
+    Returns list of keyword dicts ranked by composite score.
+    """
+    if not _has_client() or not keyword_data.get("services"):
+        return []
+
+    # Collect all keywords from services
+    all_keywords = set()
+    service_map = {}
+    type_map = {}
+
+    for svc in keyword_data["services"]:
+        svc_name = svc.get("service", "")
+        for ktype, kfield in [("primary","primary"),("secondary","secondary"),
+                               ("short_tail","short_tail"),("long_tail","long_tail")]:
+            vals = svc.get(kfield, []) if isinstance(svc.get(kfield), list) else [svc.get(kfield, "")]
+            for kw in vals:
+                if kw:
+                    all_keywords.add(kw)
+                    service_map[kw] = svc_name
+                    type_map[kw] = ktype
+        for kw in svc.get("keywords", []):
+            if kw:
+                all_keywords.add(kw)
+                service_map[kw] = svc_name
+                if kw not in type_map:
+                    type_map[kw] = "service"
+
+    # Brand keywords
+    for bkw in [brand_name, f"{brand_name} services", f"{brand_name} reviews",
+                 f"{brand_name} pricing", f"{brand_name} near me"]:
+        if bkw.strip():
+            all_keywords.add(bkw)
+            service_map[bkw] = "Brand"
+            type_map[bkw] = "brand"
+
+    keyword_list = list(all_keywords)[:100]
+
+    # AI estimate metrics in batches of 25
+    all_metrics = {}
+    for batch_start in range(0, len(keyword_list), 25):
+        batch = keyword_list[batch_start:batch_start + 25]
+        kw_list_str = "\n".join(f"{i+1}. {kw}" for i, kw in enumerate(batch))
+        prompt = f"""Estimate monthly search volume, CPC (USD), competition level, and intent for each keyword for {location}.
+Keywords:
+{kw_list_str}
+Return ONLY valid JSON (no markdown):
+{{"keywords":[{{"keyword":"text","search_volume":1000,"cpc":1.50,"competition":"HIGH","competition_index":0.75,"intent":"informational"}}]}}
+Rules: search_volume=int, cpc=decimal, competition=HIGH|MEDIUM|LOW, intent=informational|transactional|navigational|commercial"""
+        try:
+            raw = ai_chat(prompt, max_tokens=2000, temperature=0.3, use_sonnet=False)
+            result = _parse_obj(raw)
+            for item in result.get("keywords", []):
+                all_metrics[item.get("keyword","").lower()] = item
+        except Exception as e:
+            logger.error(f"ai_keyword_planner_pipeline batch error: {e}")
+
+    # Build ranked keyword list
+    keywords_full = []
+    for kw in keyword_list:
+        m = all_metrics.get(kw.lower(), {})
+        is_brand = type_map.get(kw,"") == "brand" or brand_name.lower() in kw.lower()
+        keywords_full.append({
+            "keyword":          kw,
+            "keyword_type":     type_map.get(kw, "secondary"),
+            "competition_level":m.get("competition", "MEDIUM"),
+            "search_volume":    int(m.get("search_volume", 0) or 0),
+            "cpc":              float(m.get("cpc", 0.0) or 0.0),
+            "competition_index":float(m.get("competition_index", 0.5) or 0.5),
+            "is_brand_keyword": 1 if is_brand else 0,
+            "service_name":     service_map.get(kw, ""),
+            "intent":           m.get("intent", "informational"),
+        })
+
+    # Rank by composite score
+    max_vol = max((k["search_volume"] for k in keywords_full), default=1) or 1
+    max_cpc = max((k["cpc"] for k in keywords_full), default=1) or 1
+    intent_scores = {"transactional":1.0,"commercial":0.8,"informational":0.5,"navigational":0.3}
+    for kw in keywords_full:
+        vol_score   = (kw["search_volume"] / max_vol) * 40
+        cpc_score   = (kw["cpc"] / max_cpc) * 20
+        comp_score  = {"LOW":20,"MEDIUM":10,"HIGH":5}.get(kw["competition_level"], 10)
+        intent_score= intent_scores.get(kw["intent"], 0.5) * 20
+        kw["rank_score"] = round(vol_score + cpc_score + comp_score + intent_score, 2)
+
+    keywords_full.sort(key=lambda x: x.get("rank_score", 0), reverse=True)
+    for i, kw in enumerate(keywords_full, 1):
+        kw["keyword_rank"] = i
+        if kw["competition_level"] == "HIGH" and kw["search_volume"] > 1000:
+            kw["keyword_difficulty"] = "Hard"
+        elif kw["competition_level"] == "LOW" or kw["search_volume"] < 100:
+            kw["keyword_difficulty"] = "Easy"
+        else:
+            kw["keyword_difficulty"] = "Medium"
+        # keyword_category
+        is_brand = kw.get("is_brand_keyword", 0)
+        comp = kw["competition_level"]
+        intent = kw["intent"]
+        if is_brand:
+            kw["keyword_category"] = "branded"
+        elif comp == "HIGH" and intent in ("transactional", "commercial"):
+            kw["keyword_category"] = "high_competition_commercial"
+        elif comp == "HIGH":
+            kw["keyword_category"] = "high_competition"
+        elif intent in ("transactional", "commercial"):
+            kw["keyword_category"] = "commercial"
+        elif intent == "informational":
+            kw["keyword_category"] = "informational"
+        elif comp == "LOW":
+            kw["keyword_category"] = "low_competition_opportunity"
+        else:
+            kw["keyword_category"] = "medium_competition"
+
+    logger.info(f"ai_keyword_planner_pipeline: {len(keywords_full)} keywords ranked")
+    return keywords_full
+
+
+def ai_generate_llm_prompts(keyword_data: dict, keywords_ranked: list,
+                             brand_name: str, location: str = "Global") -> list:
+    """
+    Generate LLM prompts (questions users type into ChatGPT/Perplexity/Gemini)
+    based on keyword data. Mirrors crawler_2.py generate_llm_prompts().
+    """
+    if not _has_client() or not keywords_ranked:
+        return []
+
+    services = [s.get("service","") for s in keyword_data.get("services", [])]
+    business_type = keyword_data.get("business_type", "")
+    brand_lower = brand_name.lower().strip()
+
+    non_branded = [k for k in keywords_ranked
+                   if not k.get("is_brand_keyword") and brand_lower not in k.get("keyword","").lower()]
+    branded     = [k for k in keywords_ranked
+                   if k.get("is_brand_keyword") or brand_lower in k.get("keyword","").lower()]
+
+    high_vol = sorted([k for k in non_branded if k.get("search_volume",0) > 0],
+                      key=lambda x: x.get("search_volume",0), reverse=True)[:30]
+
+    all_prompts = []
+
+    def _call(prompt_text, batch_name):
+        try:
+            raw = ai_chat(prompt_text, max_tokens=3000, temperature=0.3, use_sonnet=True)
+            result = _parse_arr(raw)
+            logger.info(f"llm_prompts {batch_name}: {len(result)} prompts")
+            return result
+        except Exception as e:
+            logger.error(f"llm_prompts {batch_name} error: {e}")
+            return []
+
+    # High competition prompts
+    if high_vol[:15]:
+        kw_list = "\n".join(f"- \"{k['keyword']}\" (Vol:{k['search_volume']}, Service:{k['service_name']})"
+                             for k in high_vol[:15])
+        all_prompts.extend(_call(f"""Generate search prompts for HIGH COMPETITION keywords. Location: {location}
+Business Type: {business_type}
+Keywords:
+{kw_list}
+Rules: 2 prompts per keyword. DO NOT include brand name "{brand_name}". Use natural question format.
+Return ONLY JSON array:
+[{{"prompt_text":"prompt","prompt_type":"high_competition","target_keyword":"kw","search_volume":1000,"ai_engine":"All","service_name":"svc","priority":"high"}}]""", "high_competition"))
+
+    # Informational prompts
+    info_kws = [k for k in high_vol if k.get("intent") == "informational"][:10]
+    if info_kws:
+        kw_list = "\n".join(f"- \"{k['keyword']}\""  for k in info_kws)
+        all_prompts.extend(_call(f"""Generate INFORMATIONAL search prompts. Location: {location}
+Keywords:
+{kw_list}
+Rules: 2 prompts per keyword. DO NOT include "{brand_name}". Use what/how/why format.
+Return ONLY JSON array:
+[{{"prompt_text":"prompt","prompt_type":"informational","target_keyword":"kw","search_volume":500,"ai_engine":"All","service_name":"svc","priority":"medium"}}]""", "informational"))
+
+    # Branded prompts
+    if branded[:10]:
+        branded_list = "\n".join(f"- \"{k['keyword']}\"" for k in branded[:10])
+        all_prompts.extend(_call(f"""Generate BRANDED search prompts for "{brand_name}".
+Brand: {brand_name} | Location: {location} | Services: {", ".join(services[:6])}
+Branded keywords:
+{branded_list}
+Generate 10 prompts. Every prompt MUST contain "{brand_name}".
+Return ONLY JSON array:
+[{{"prompt_text":"prompt with {brand_name}","prompt_type":"branded","target_keyword":"kw","search_volume":100,"ai_engine":"All","service_name":"Brand","priority":"high"}}]""", "branded"))
+
+    # Deduplicate
+    seen = set()
+    final = []
+    for p in all_prompts:
+        text = p.get("prompt_text","").strip()
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            p["suggested_answer"] = ""
+            vol = p.get("search_volume", 0)
+            try: vol = int(vol)
+            except: vol = 0
+            p["search_volume"] = vol
+            p["priority"] = "high" if vol >= 1000 else ("medium" if vol >= 200 else "low")
+            final.append(p)
+
+    logger.info(f"ai_generate_llm_prompts: {len(final)} total prompts generated")
+    return final

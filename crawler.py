@@ -26,9 +26,9 @@ from threading import Lock
 
 logger = logging.getLogger(__name__)
 
-CRAWL_TIMEOUT       = 30
+CRAWL_TIMEOUT       = 25    # Reduced to prevent SSL/connection drops
 BROKEN_LINK_TIMEOUT = 8
-MAX_WORKERS         = 15
+MAX_WORKERS         = 8     # Reduced concurrency to prevent rate-limiting
 
 HEADERS = {
     "User-Agent": (
@@ -85,11 +85,24 @@ def _get_session():
 
 
 def _safe_get(url, timeout=CRAWL_TIMEOUT, **kw):
+    """GET with SSL fallback + one retry on connection reset."""
+    import time as _time
     s = _get_session()
-    try:
-        return s.get(url, timeout=timeout, allow_redirects=True, **kw)
-    except Exception:
-        return s.get(url, timeout=timeout, allow_redirects=True, verify=False, **kw)
+    for _attempt in range(2):
+        try:
+            return s.get(url, timeout=timeout, allow_redirects=True, **kw)
+        except requests.exceptions.SSLError:
+            return s.get(url, timeout=timeout, allow_redirects=True, verify=False, **kw)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as _ce:
+            if _attempt == 0:
+                logger.debug(f"Connection reset {url[:60]} — retry in 3s")
+                _time.sleep(3)
+                continue
+            raise
+        except Exception:
+            raise
+    raise requests.exceptions.ConnectionError(f"Failed after 2 attempts: {url}")
 
 
 def _safe_head(url, timeout=BROKEN_LINK_TIMEOUT, **kw):
@@ -245,16 +258,21 @@ def _check_file(domain, path, sitemap_urls_out=None):
 
 
 def _get_pagespeed(url, strategy):
-    if not PAGESPEED_API_KEY:
-        return {"score": "N/A", "lcp": "N/A", "cls": "N/A", "fcp": "N/A"}
+    """Fetch PageSpeed Insights. Works without API key (free tier); key adds higher quota."""
     try:
         import requests as _req
+        params = {"url": url, "strategy": strategy}
+        if PAGESPEED_API_KEY:
+            params["key"] = PAGESPEED_API_KEY
         r = _req.get(
             "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
-            params={"url": url, "strategy": strategy, "key": PAGESPEED_API_KEY},
-            timeout=60,
+            params=params,
+            timeout=90,
         )
         data = r.json()
+        if "error" in data:
+            logger.warning(f"PageSpeed [{strategy}] API error for {url}: {data['error'].get('message','')}")
+            return {"score": "N/A", "lcp": "N/A", "cls": "N/A", "fcp": "N/A"}
         lh = data.get("lighthouseResult", {})
         audits = lh.get("audits", {})
         perf = lh.get("categories", {}).get("performance", {}).get("score")
@@ -271,6 +289,60 @@ def _get_pagespeed(url, strategy):
 
 
 # ── Page Crawler ──────────────────────────────────────────────────────────────
+
+
+def _analyze_page_schema(url: str, html_text: str) -> dict:
+    """Deep schema markup analysis per page — detects existing and recommends missing schemas."""
+    from bs4 import BeautifulSoup as _BS
+    soup = _BS(html_text, "html.parser")
+    found = []; snippets = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if isinstance(item, dict):
+                    found.append(item.get("@type", "Unknown"))
+                    snippets.append(json.dumps(item, indent=2)[:2000])
+        except Exception:
+            pass
+    for el in soup.find_all(attrs={"itemtype": True}):
+        it = el.get("itemtype", "")
+        if "schema.org" in it:
+            nm = it.split("/")[-1]
+            if nm not in found:
+                found.append(f"Microdata:{nm}")
+    # Rule-based schema recommendations
+    recommended = ["WebPage"]
+    path = url.lower()
+    if path.count("/") <= 3:
+        recommended.extend(["Organization", "WebSite"])
+    if any(w in path for w in ["/about", "/team", "/company"]):
+        recommended.extend(["Organization", "AboutPage"])
+    if any(w in path for w in ["/contact", "/get-in-touch"]):
+        recommended.extend(["ContactPage", "LocalBusiness"])
+    if any(w in path for w in ["/service", "/product", "/solution"]):
+        recommended.extend(["Service", "Product"])
+    if any(w in path for w in ["/blog", "/article", "/news", "/post"]):
+        recommended.extend(["Article", "BlogPosting", "BreadcrumbList"])
+    if any(w in path for w in ["/faq", "/frequently"]):
+        recommended.append("FAQPage")
+    if any(w in path for w in ["/pricing", "/plans"]):
+        recommended.extend(["PriceSpecification", "Offer"])
+    if path.count("/") > 3 and "BreadcrumbList" not in recommended:
+        recommended.append("BreadcrumbList")
+    recommended = list(set(recommended))
+    missing = [s for s in recommended if s not in found]
+    status = "Missing" if not found else ("Partial" if missing else "Complete")
+    return {
+        "page_url":             url,
+        "schema_types_found":   found,
+        "schema_snippets":      snippets,
+        "recommended_schemas":  recommended,
+        "recommended_snippets": [],
+        "schema_status":        status,
+        "missing_schemas":      missing,
+    }
 
 def _crawl_page(url, base_url, domain, pages_list, images_list,
                 pending_links, content_hash_map, pages_lock, images_lock, broken_lock):
@@ -402,6 +474,11 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
             pass
     pd["schema_markup"]      = "Present" if schema_types else "Missing"
     pd["schema_types_found"] = ", ".join(schema_types) if schema_types else "None"
+    # Per-page deep schema analysis (stored in schema_markup_analysis table)
+    try:
+        pd["_schema_analysis"] = _analyze_page_schema(url, html_text)
+    except Exception:
+        pd["_schema_analysis"] = None
 
     # Hreflang
     hl_links = soup.find_all("link", rel="alternate", hreflang=True)
@@ -573,6 +650,8 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
         db_insert_axo, db_insert_scorecard, db_insert_aeo_faq,
         db_insert_site_analysis, db_insert_generated_files,
         db_mark_url_progress,
+        db_insert_new_page_suggestions, db_insert_keyword_planner,
+        db_insert_schema_analysis, db_insert_llm_prompts, db_insert_depth_analysis,
     )
     from scorecard import build_scorecard
 
@@ -795,6 +874,15 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     six_month_plan_data = {}; internal_linking_data = {}
     keyword_url_map_data = []; axo_data = {}
     new_page_suggestions = []
+    keyword_planner_data = []
+    llm_prompts_data = []
+    depth_analysis_data = []
+    schema_analysis_data = []
+    # New: keyword planner, schema, LLM prompts, depth analysis
+    keyword_planner_data = []
+    schema_analysis_data = []
+    llm_prompts_data = []
+    depth_analysis_data = []
 
     if ai_mode != "4":
         from ai_helpers import (
@@ -825,6 +913,15 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
         brand_name = domain.replace("www.", "").split(".")[0]
         keyword_data = ai_keyword_analysis(all_content, brand_name, detected_location)
 
+        # Auto-detect business_type from AI if not supplied via API param
+        if not business_type and keyword_data.get("business_type"):
+            business_type = keyword_data["business_type"]
+            logger.info(f"business_type auto-detected: {business_type}")
+        elif business_type:
+            # API param overrides AI — sync back into keyword_data
+            keyword_data["business_type"] = business_type
+            logger.info(f"business_type from request param: {business_type}")
+
         if keyword_data.get("services"):
             blog_topics_data       = ai_blog_topics(keyword_data, brand_name, detected_location)
             backlink_strategy_data = ai_backlink_strategy(keyword_data, brand_name, domain, detected_location)
@@ -841,12 +938,77 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
             keyword_url_map_data  = ai_keyword_url_mapping(pages_200, keyword_data, domain, detected_location)
             axo_data              = ai_axo_recommendations(pages_200, keyword_data, domain, detected_location)
 
-            # New page suggestions
+            # ── Keyword Planner (search volume, CPC, competition ranking) ──
+            logger.info("Running keyword planner pipeline...")
+            try:
+                from ai_helpers import ai_keyword_planner_pipeline
+                keyword_planner_data = ai_keyword_planner_pipeline(keyword_data, brand_name, detected_location)
+                logger.info(f"keyword_planner: {len(keyword_planner_data)} keywords ranked")
+            except ImportError:
+                logger.warning("ai_keyword_planner_pipeline not in ai_helpers — skipping")
+            except Exception as kp_err:
+                logger.error(f"keyword_planner FAILED: {kp_err}")
+
+            # ── LLM Prompts (AI search engine prompt generation) ──
+            logger.info("Generating LLM prompts...")
+            try:
+                from ai_helpers import ai_generate_llm_prompts
+                llm_prompts_data = ai_generate_llm_prompts(keyword_data, keyword_planner_data, brand_name, detected_location)
+                logger.info(f"llm_prompts: {len(llm_prompts_data)} prompts generated")
+            except ImportError:
+                logger.warning("ai_generate_llm_prompts not in ai_helpers — skipping")
+            except Exception as lp_err:
+                logger.error(f"llm_prompts FAILED: {lp_err}")
+
+            # ── New Page Suggestions ──
+            logger.info("Generating new page suggestions...")
             try:
                 from ai_helpers import ai_new_page_suggestions
                 new_page_suggestions = ai_new_page_suggestions(pages_200, keyword_data, domain, brand_name, detected_location)
+                logger.info(f"new_page_suggestions: {len(new_page_suggestions)} suggestions")
             except ImportError:
-                logger.warning("ai_new_page_suggestions not found in ai_helpers — skipping")
+                logger.warning("ai_new_page_suggestions not in ai_helpers — skipping")
+            except Exception as nps_err:
+                logger.error(f"new_page_suggestions FAILED: {nps_err}")
+
+    # depth_analysis and schema_analysis built below before scorecard
+
+    # ── Depth Analysis — built from all crawled pages ──
+    depth_analysis_data = []
+    for p in pages_list:
+        if not p.get("url"):
+            continue
+        depth_analysis_data.append({
+            "depth_level":          int(p.get("crawl_depth", 0) or 0),
+            "page_url":             p.get("url", ""),
+            "page_title":           p.get("current_title", "") or "",
+            "parent_url":           "",
+            "seo_score":            int(p.get("seo_score", 0) or 0),
+            "status_code":          str(p.get("status", "")),
+            "word_count":           int(p.get("word_count", 0) or 0),
+            "has_schema":           p.get("schema_markup") == "Present",
+            "internal_links_count": 0,
+        })
+    logger.info(f"depth_analysis: {len(depth_analysis_data)} records built")
+
+    # ── Schema Analysis — built from _schema_analysis collected during crawl ──
+    schema_analysis_data = []
+    for p in pages_list:
+        sa = p.get("_schema_analysis")
+        if sa and sa.get("page_url"):
+            schema_analysis_data.append(sa)
+        elif str(p.get("status", "")).startswith("200") or p.get("status") == 200:
+            stypes = p.get("schema_types_found", "")
+            schema_analysis_data.append({
+                "page_url":             p.get("url", ""),
+                "schema_types_found":   stypes.split(", ") if stypes and stypes != "None" else [],
+                "schema_snippets":      [],
+                "recommended_schemas":  [],
+                "recommended_snippets": [],
+                "schema_status":        p.get("schema_markup", "Missing"),
+                "missing_schemas":      [],
+            })
+    logger.info(f"schema_analysis: {len(schema_analysis_data)} records built")
 
     # ── Scorecard ──────────────────────────────────────────────────────────────
     scorecard_results, global_checks = build_scorecard(
@@ -874,26 +1036,25 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
             release_db_conn(_c)
 
     logger.info(f"Saving site-wide data to DB (audit #{audit_id})...")
-    _safe_db_insert("scorecard",           db_insert_scorecard,        audit_id, scorecard_results, global_checks)
-    _safe_db_insert("aeo_faq",             db_insert_aeo_faq,          audit_id, pages_list)
-    _safe_db_insert("site_analysis",       db_insert_site_analysis,    audit_id, site_analysis_data)
-    _safe_db_insert("generated_files",     db_insert_generated_files,  audit_id, generated_files)
-    _safe_db_insert("seo_keywords",        db_insert_keywords,         audit_id, keyword_data)
-    _safe_db_insert("blog_topics",         db_insert_blog_topics,      audit_id, blog_topics_data)
-    _safe_db_insert("backlink_strategies", db_insert_backlinks,        audit_id, backlink_strategy_data)
-    _safe_db_insert("six_month_plan",      db_insert_plan,             audit_id, six_month_plan_data)
-    _safe_db_insert("internal_linking",    db_insert_internal_linking, audit_id, internal_linking_data)
-    _safe_db_insert("keyword_url_mappping",     db_insert_kw_url_map,       audit_id, keyword_url_map_data)
-    _safe_db_insert("axo_recommendations", db_insert_axo,              audit_id, axo_data)
+    _safe_db_insert("scorecard",            db_insert_scorecard,          audit_id, scorecard_results, global_checks)
+    _safe_db_insert("aeo_faq",              db_insert_aeo_faq,            audit_id, pages_list)
+    _safe_db_insert("site_analysis",        db_insert_site_analysis,      audit_id, site_analysis_data)
+    _safe_db_insert("generated_files",      db_insert_generated_files,    audit_id, generated_files)
+    _safe_db_insert("seo_keywords",         db_insert_keywords,           audit_id, keyword_data)
+    _safe_db_insert("blog_topics",          db_insert_blog_topics,        audit_id, blog_topics_data)
+    _safe_db_insert("backlink_strategies",  db_insert_backlinks,          audit_id, backlink_strategy_data)
+    _safe_db_insert("six_month_plan",       db_insert_plan,               audit_id, six_month_plan_data)
+    _safe_db_insert("internal_linking",     db_insert_internal_linking,   audit_id, internal_linking_data)
+    _safe_db_insert("keyword_url_mapping",  db_insert_kw_url_map,         audit_id, keyword_url_map_data)
+    _safe_db_insert("axo_recommendations",  db_insert_axo,                audit_id, axo_data)
 
-    # New page suggestions (optional table)
-    if new_page_suggestions:
-        try:
-            from db import db_insert_new_page_suggestions
-            _safe_db_insert("new_page_suggestions", db_insert_new_page_suggestions,
-                            audit_id, new_page_suggestions)
-        except ImportError:
-            logger.warning("db_insert_new_page_suggestions not in db.py — skipping")
+    # ── New tables — always save, log counts so empty tables are visible ──
+    logger.info(f"  new_page_suggestions={len(new_page_suggestions)} "                f"keyword_planner={len(keyword_planner_data)} "                f"schema_analysis={len(schema_analysis_data)} "                f"llm_prompts={len(llm_prompts_data)} "                f"depth_analysis={len(depth_analysis_data)}")
+    _safe_db_insert("new_page_suggestions",   db_insert_new_page_suggestions, audit_id, new_page_suggestions)
+    _safe_db_insert("keyword_planner",        db_insert_keyword_planner,      audit_id, keyword_planner_data)
+    _safe_db_insert("schema_markup_analysis", db_insert_schema_analysis,      audit_id, schema_analysis_data)
+    _safe_db_insert("llm_prompts",            db_insert_llm_prompts,          audit_id, llm_prompts_data)
+    _safe_db_insert("depth_analysis",         db_insert_depth_analysis,       audit_id, depth_analysis_data)
 
     logger.info("All site-wide DB saves complete.")
 
@@ -946,7 +1107,7 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
             "gbp_status":        gbp_status,
             "site_recommendation": site_recommendation_text,
             "detected_location": detected_location,
-            "business_type":     keyword_data.get("business_type", ""),
+            "business_type":     business_type or keyword_data.get("business_type", ""),
             "ssl_status":        ssl_status,
             "www_resolve":       www_resolve,
             "sitemap_size":      sitemap_size,
@@ -978,12 +1139,13 @@ def _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespe
                                     pd.get("current_title", ""),
                                     pd.get("current_meta_description", ""),
                                     pd.get("current_h1", ""), content)
-                mob_f  = sub.submit(_get_pagespeed, url, "mobile")  if run_pagespeed else None
-                desk_f = sub.submit(_get_pagespeed, url, "desktop") if run_pagespeed else None
+                # PageSpeed always runs — free tier works without API key
+                mob_f  = sub.submit(_get_pagespeed, url, "mobile")
+                desk_f = sub.submit(_get_pagespeed, url, "desktop")
 
                 ai      = ai_f.result(timeout=120) or {}
-                mobile  = mob_f.result(timeout=120)  if mob_f  else {"score": "N/A", "lcp": "N/A", "cls": "N/A", "fcp": "N/A"}
-                desktop = desk_f.result(timeout=120) if desk_f else {"score": "N/A", "lcp": "N/A", "cls": "N/A", "fcp": "N/A"}
+                mobile  = mob_f.result(timeout=120)
+                desktop = desk_f.result(timeout=120)
 
             pd.update({
                 "primary_keyword":          ai.get("primary_keyword", ""),
