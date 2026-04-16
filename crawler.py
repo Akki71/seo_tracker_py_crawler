@@ -380,9 +380,27 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
         return []
 
     if isinstance(status, int) and status >= 500:
-        with pages_lock:
-            pages_list.append(pd)
-        return []
+        # Retry once for transient 500 errors (mirrors old crawl() behaviour)
+        try:
+            import time as _time
+            _time.sleep(2)
+            r2 = _safe_get(url, timeout=CRAWL_TIMEOUT)
+            if r2.status_code == 200:
+                html_text        = r2.text
+                status           = 200
+                response_headers = dict(r2.headers)
+                pd["status"]     = "200 (recovered from 500)"
+                # fall through to full 200 parse below
+            else:
+                pd["status"] = status
+                with pages_lock:
+                    pages_list.append(pd)
+                return []
+        except Exception:
+            pd["status"] = status
+            with pages_lock:
+                pages_list.append(pd)
+            return []
 
     if status != 200:
         if isinstance(status, int) and status in (301, 302, 307, 308):
@@ -948,6 +966,21 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
                 logger.warning("ai_keyword_planner_pipeline not in ai_helpers — skipping")
             except Exception as kp_err:
                 logger.error(f"keyword_planner FAILED: {kp_err}")
+
+            # ── Keyword-enriched Blog Topics (replaces plain blog_topics if available) ──
+            if keyword_planner_data:
+                try:
+                    from ai_helpers import generate_blog_ideas_with_keywords
+                    enriched_blog = generate_blog_ideas_with_keywords(
+                        keyword_data, keyword_planner_data, brand_name, detected_location,
+                        existing_pages=pages_200
+                    )
+                    if enriched_blog:
+                        blog_topics_data = enriched_blog
+                        logger.info(f"Using keyword-enriched blog topics: "
+                                    f"{sum(len(s.get('topics',[])) for s in blog_topics_data)} topics")
+                except Exception as blog_err:
+                    logger.warning(f"generate_blog_ideas_with_keywords skipped: {blog_err}")
 
             # ── LLM Prompts (AI search engine prompt generation) ──
             logger.info("Generating LLM prompts...")
