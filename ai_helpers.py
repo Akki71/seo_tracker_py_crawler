@@ -5,6 +5,11 @@ Compatible with: openai==1.59.0 + anthropic==0.40.0 + httpx==0.28.1
 
 import os, json, re, logging
 from datetime import datetime
+import os
+from dotenv import load_dotenv
+
+# Load .env file
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -13,8 +18,14 @@ openai_client    = None
 anthropic_client = None
 _ai_mode         = "4"
 
-OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise ValueError("Missing OPENAI_API_KEY in .env")
+
+if not ANTHROPIC_API_KEY:
+    raise ValueError("Missing ANTHROPIC_API_KEY in .env")
 
 CLAUDE_HAIKU  = os.environ.get("CLAUDE_HAIKU_MODEL",  "claude-haiku-4-5-20251001")
 CLAUDE_SONNET = os.environ.get("CLAUDE_SONNET_MODEL", "claude-sonnet-4-20250514")
@@ -769,25 +780,176 @@ Return ONLY valid JSON array (no markdown):
     except Exception as e: logger.error(f"ai_new_page_suggestions: {e}"); return []
 
 
+
+# =============================================================================
+# GOOGLE ADS KEYWORD PLANNER — Full Integration (ported from old monolith)
+# =============================================================================
+def get_env(key):
+    value = os.getenv(key)
+    if not value:
+        raise ValueError(f"Missing environment variable: {key}")
+    return value
+
+GOOGLE_ADS_CONFIG = {
+    "developer_token": get_env("GOOGLE_ADS_DEVELOPER_TOKEN"),
+    "client_id": get_env("GOOGLE_ADS_CLIENT_ID"),
+    "client_secret": get_env("GOOGLE_ADS_CLIENT_SECRET"),
+    "refresh_token": get_env("GOOGLE_ADS_REFRESH_TOKEN"),
+    "customer_id": get_env("GOOGLE_ADS_CUSTOMER_ID"),
+}
+
+_google_ads_available = False
+_google_ads_client    = None
+
+
+def setup_google_ads() -> bool:
+    """
+    Initialize Google Ads client for Keyword Planner API.
+    Called automatically inside keyword_planner_pipeline().
+    Install: pip install google-ads --break-system-packages
+    """
+    global _google_ads_available, _google_ads_client
+    try:
+        from google.ads.googleads.client import GoogleAdsClient
+        config = {
+            "developer_token": GOOGLE_ADS_CONFIG["developer_token"],
+            "client_id":       GOOGLE_ADS_CONFIG["client_id"],
+            "client_secret":   GOOGLE_ADS_CONFIG["client_secret"],
+            "refresh_token":   GOOGLE_ADS_CONFIG["refresh_token"],
+            "use_proto_plus":  True,
+        }
+        _google_ads_client    = GoogleAdsClient.load_from_dict(config)
+        _google_ads_available = True
+        logger.info("Google Ads Keyword Planner: Connected.")
+        return True
+    except ImportError:
+        logger.warning("google-ads not installed. pip install google-ads --break-system-packages")
+        return False
+    except Exception as e:
+        logger.error(f"Google Ads setup error: {e}")
+        return False
+
+
+def get_keyword_metrics_google(keywords_list: list,
+                                language_id: str = "1000",
+                                geo_target: str  = "2356") -> dict:
+    """
+    Fetch real search volume, CPC, competition from Google Ads Keyword Planner API.
+    Returns dict keyed by lowercase keyword.
+    Falls back gracefully to {} if unavailable.
+    """
+    if not _google_ads_available or not _google_ads_client:
+        return {}
+    customer_id = GOOGLE_ADS_CONFIG["customer_id"].replace("-", "")
+    results: dict = {}
+    try:
+        kp_service = _google_ads_client.get_service("KeywordPlanIdeaService")
+        kp_network  = _google_ads_client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
+        request     = _google_ads_client.get_type("GenerateKeywordIdeasRequest")
+        request.customer_id          = customer_id
+        request.language             = f"languageConstants/{language_id}"
+        request.geo_target_constants.append(f"geoTargetConstants/{geo_target}")
+        request.keyword_plan_network = kp_network
+        request.include_adult_keywords = False
+
+        comp_map = {0: "UNSPECIFIED", 1: "UNKNOWN", 2: "LOW", 3: "MEDIUM", 4: "HIGH"}
+
+        for batch_start in range(0, len(keywords_list), 20):
+            batch = keywords_list[batch_start: batch_start + 20]
+            request.keyword_seed.keywords.clear()
+            for kw in batch:
+                request.keyword_seed.keywords.append(kw)
+            try:
+                response = kp_service.generate_keyword_ideas(request=request)
+                for idea in response.results:
+                    keyword = idea.text
+                    m       = idea.keyword_idea_metrics
+                    results[keyword.lower()] = {
+                        "search_volume":     int(m.avg_monthly_searches or 0),
+                        "cpc":               round(m.average_cpc_micros / 1_000_000, 2) if m.average_cpc_micros else 0.0,
+                        "competition":       comp_map.get(int(m.competition), "UNKNOWN"),
+                        "competition_index": round(m.competition_index / 100, 4) if m.competition_index else 0.0,
+                    }
+                logger.info(f"KW Planner batch {batch_start//20+1}: {len(batch)} keywords processed.")
+                import time; time.sleep(1)
+            except Exception as be:
+                logger.error(f"KW Planner batch error: {be}")
+                continue
+    except Exception as e:
+        logger.error(f"Google Ads Keyword Planner error: {e}")
+    return results
+
+
+# =============================================================================
+# KEYWORD PLANNER PIPELINE — tries Google Ads first, falls back to AI
+# =============================================================================
+
+GOOGLE_ADS_GEO_MAP = {
+    "india":         "2356",
+    "us":            "2840",
+    "usa":           "2840",
+    "united states": "2840",
+    "uk":            "2826",
+    "united kingdom":"2826",
+    "australia":     "2036",
+    "canada":        "2124",
+    "germany":       "2276",
+    "france":        "2250",
+    "singapore":     "2702",
+    "uae":           "2784",
+    "south africa":  "2710",
+}
+
+
 def ai_keyword_planner_pipeline(keyword_data: dict, brand_name: str, location: str = "Global") -> list:
-    """Generate 100 keywords with AI-estimated search volume, CPC, competition, intent."""
-    if not _has_client() or not keyword_data.get("services"): return []
-    all_keywords = set(); service_map = {}; type_map = {}
-    for svc in keyword_data["services"]:
-        svc_name = svc.get("service","")
-        for ktype, kfield in [("primary","primary"),("secondary","secondary"),("short_tail","short_tail"),("long_tail","long_tail")]:
-            vals = svc.get(kfield,[]) if isinstance(svc.get(kfield), list) else [svc.get(kfield,"")]
+    """
+    Full pipeline:
+      1. Collect seed keywords from crawler AI analysis
+      2. Expand to 100 keywords using AI
+      3. Try Google Ads Keyword Planner for REAL metrics (volume, CPC, competition)
+      4. Fall back to AI metric estimation if Google Ads unavailable
+      5. Rank by composite score and assign categories
+    """
+    if not _has_client() and not keyword_data.get("services"):
+        return []
+
+    # ── Step 1: Collect seed keywords ──────────────────────────────────────────
+    all_keywords: set = set()
+    service_map: dict = {}
+    type_map:    dict = {}
+
+    for svc in keyword_data.get("services", []):
+        svc_name = svc.get("service", "")
+        for ktype, kfield in [("primary","primary"),("secondary","secondary"),
+                               ("short_tail","short_tail"),("long_tail","long_tail")]:
+            vals = svc.get(kfield, [])
+            if not isinstance(vals, list):
+                vals = [vals] if vals else []
             for kw in vals:
-                if kw: all_keywords.add(kw); service_map[kw] = svc_name; type_map[kw] = ktype
-        for kw in svc.get("keywords",[]):
-            if kw: all_keywords.add(kw); service_map[kw] = svc_name; type_map.setdefault(kw, "service")
-    for bkw in [brand_name, f"{brand_name} services", f"{brand_name} reviews", f"{brand_name} pricing",
-                f"{brand_name} near me", f"{brand_name} {location}", f"{brand_name} alternatives", f"best {brand_name} services"]:
-        if bkw.strip(): all_keywords.add(bkw); service_map[bkw] = "Brand"; type_map[bkw] = "brand"
-    # AI expand to 100
+                if kw:
+                    all_keywords.add(kw)
+                    service_map[kw] = svc_name
+                    type_map[kw]    = ktype
+        for kw in svc.get("keywords", []):
+            if kw:
+                all_keywords.add(kw)
+                service_map[kw] = svc_name
+                type_map.setdefault(kw, "service")
+
+    # Brand keywords
+    for bkw in [brand_name, f"{brand_name} services", f"{brand_name} reviews",
+                f"{brand_name} pricing", f"{brand_name} near me",
+                f"{brand_name} {location}", f"{brand_name} alternatives",
+                f"best {brand_name} services"]:
+        if bkw.strip():
+            all_keywords.add(bkw)
+            service_map[bkw] = "Brand"
+            type_map[bkw]    = "brand"
+
+    # ── Step 2: AI expansion to 100 ────────────────────────────────────────────
     if len(all_keywords) < 100 and _has_client():
-        needed = 100 - len(all_keywords)
-        services_list = ", ".join([s["service"] for s in keyword_data["services"]])
+        needed        = 100 - len(all_keywords)
+        services_list = ", ".join([s["service"] for s in keyword_data.get("services", [])])
         existing_list = "\n".join(list(all_keywords)[:50])
         prompt = f"""Generate {needed} additional SEO keywords. Mix high/medium/low competition.
 Business: {brand_name} | Location: {location} | Services: {services_list}
@@ -797,65 +959,119 @@ Include: transactional, informational, comparison, how-to, best, near-me, questi
 Return ONLY JSON: [{{"keyword":"text","type":"primary|secondary|short_tail|long_tail|brand","service":"Name","competition_estimate":"HIGH|MEDIUM|LOW"}}]"""
         try:
             for item in _parse_arr(ai_chat(prompt, max_tokens=3000, temperature=0.4, use_sonnet=True)):
-                kw = item.get("keyword","")
+                kw = item.get("keyword", "")
                 if kw and kw not in all_keywords:
-                    all_keywords.add(kw); service_map[kw] = item.get("service","General"); type_map[kw] = item.get("type","secondary")
-        except Exception as e: logger.error(f"ai_keyword_planner expansion: {e}")
+                    all_keywords.add(kw)
+                    service_map[kw] = item.get("service", "General")
+                    type_map[kw]    = item.get("type", "secondary")
+        except Exception as e:
+            logger.error(f"ai_keyword_planner expansion: {e}")
+
     keyword_list = list(all_keywords)[:100]
-    # AI estimate metrics in batches
-    all_metrics = {}
-    for batch_start in range(0, len(keyword_list), 25):
-        batch = keyword_list[batch_start:batch_start+25]
-        kw_list_str = "\n".join(f"{i+1}. {kw}" for i,kw in enumerate(batch))
-        prompt = f"""Estimate monthly search volume, CPC (USD), competition level, and intent for each keyword for {location}.
+    logger.info(f"ai_keyword_planner_pipeline: {len(keyword_list)} keywords collected")
+
+    # ── Step 3: Google Ads metrics (real data) ──────────────────────────────────
+    all_metrics: dict = {}
+    google_ads_used = False
+
+    setup_google_ads()          # no-op if already done or unavailable
+
+    if _google_ads_available:
+        geo_target = "2356"     # default India
+        loc_lower  = location.lower()
+        for loc_key, geo_id in GOOGLE_ADS_GEO_MAP.items():
+            if loc_key in loc_lower:
+                geo_target = geo_id
+                break
+        google_metrics = get_keyword_metrics_google(keyword_list, geo_target=geo_target)
+        if google_metrics:
+            all_metrics      = google_metrics
+            google_ads_used  = True
+            logger.info(f"Google Ads metrics fetched for {len(google_metrics)} keywords")
+
+    # ── Step 4: AI fallback metric estimation ───────────────────────────────────
+    if not google_ads_used:
+        logger.info("Google Ads unavailable — using AI metric estimation fallback")
+        for batch_start in range(0, len(keyword_list), 25):
+            batch       = keyword_list[batch_start: batch_start + 25]
+            kw_list_str = "\n".join(f"{i+1}. {kw}" for i, kw in enumerate(batch))
+            prompt = f"""Estimate monthly search volume, CPC (USD), competition level, and intent for each keyword for {location}.
 Keywords:
 {kw_list_str}
 Return ONLY valid JSON (no markdown):
 {{"keywords":[{{"keyword":"text","search_volume":1000,"cpc":1.50,"competition":"HIGH","competition_index":0.75,"intent":"informational"}}]}}
 Rules: search_volume=int, cpc=decimal, competition=HIGH|MEDIUM|LOW, intent=informational|transactional|navigational|commercial"""
-        try:
-            for item in _parse_obj(ai_chat(prompt, max_tokens=2000, temperature=0.3, use_sonnet=False)).get("keywords",[]):
-                all_metrics[item.get("keyword","").lower()] = item
-        except Exception as e: logger.error(f"ai_keyword_planner batch: {e}")
+            try:
+                for item in _parse_obj(ai_chat(prompt, max_tokens=2000, temperature=0.3,
+                                               use_sonnet=False)).get("keywords", []):
+                    kw_key = item.get("keyword", "").lower()
+                    if kw_key:
+                        all_metrics[kw_key] = {
+                            "search_volume":     int(item.get("search_volume", 0) or 0),
+                            "cpc":               float(item.get("cpc", 0.0) or 0.0),
+                            "competition":       item.get("competition", "MEDIUM"),
+                            "competition_index": float(item.get("competition_index", 0.5) or 0.5),
+                            "intent":            item.get("intent", "informational"),
+                        }
+            except Exception as e:
+                logger.error(f"ai_keyword_planner batch: {e}")
+
+    # ── Step 5: Build full keyword objects ──────────────────────────────────────
     keywords_full = []
     for kw in keyword_list:
-        m = all_metrics.get(kw.lower(), {})
-        is_brand = type_map.get(kw,"") == "brand" or brand_name.lower() in kw.lower()
+        m        = all_metrics.get(kw.lower(), {})
+        is_brand = type_map.get(kw, "") == "brand" or brand_name.lower() in kw.lower()
         keywords_full.append({
-            "keyword": kw, "keyword_type": type_map.get(kw,"secondary"),
-            "competition_level": m.get("competition","MEDIUM"),
-            "search_volume": int(m.get("search_volume",0) or 0),
-            "cpc": float(m.get("cpc",0.0) or 0.0),
-            "competition_index": float(m.get("competition_index",0.5) or 0.5),
-            "is_brand_keyword": 1 if is_brand else 0,
-            "service_name": service_map.get(kw,""),
-            "intent": m.get("intent","informational"),
+            "keyword":           kw,
+            "keyword_type":      type_map.get(kw, "secondary"),
+            "competition_level": m.get("competition", "MEDIUM"),
+            "search_volume":     int(m.get("search_volume", 0) or 0),
+            "cpc":               float(m.get("cpc", 0.0) or 0.0),
+            "competition_index": float(m.get("competition_index", 0.5) or 0.5),
+            "is_brand_keyword":  1 if is_brand else 0,
+            "service_name":      service_map.get(kw, ""),
+            "intent":            m.get("intent", "informational"),
         })
-    max_vol = max((k["search_volume"] for k in keywords_full), default=1) or 1
-    max_cpc = max((k["cpc"] for k in keywords_full), default=1) or 1
-    intent_scores = {"transactional":1.0,"commercial":0.8,"informational":0.5,"navigational":0.3}
+
+    # ── Step 6: Rank by composite score ────────────────────────────────────────
+    max_vol   = max((k["search_volume"] for k in keywords_full), default=1) or 1
+    max_cpc   = max((k["cpc"]           for k in keywords_full), default=1) or 1
+    intent_sc = {"transactional": 1.0, "commercial": 0.8, "informational": 0.5, "navigational": 0.3}
+
     for kw in keywords_full:
         kw["rank_score"] = round(
-            (kw["search_volume"]/max_vol)*40 + (kw["cpc"]/max_cpc)*20 +
-            {"LOW":20,"MEDIUM":10,"HIGH":5}.get(kw["competition_level"],10) +
-            intent_scores.get(kw["intent"],0.5)*20, 2)
-    keywords_full.sort(key=lambda x: x.get("rank_score",0), reverse=True)
+            (kw["search_volume"] / max_vol) * 40 +
+            (kw["cpc"]           / max_cpc) * 20 +
+            {"LOW": 20, "MEDIUM": 10, "HIGH": 5}.get(kw["competition_level"], 10) +
+            intent_sc.get(kw["intent"], 0.5) * 20, 2
+        )
+
+    keywords_full.sort(key=lambda x: x.get("rank_score", 0), reverse=True)
+
     for i, kw in enumerate(keywords_full, 1):
         kw["keyword_rank"] = i
-        kw["keyword_difficulty"] = ("Hard" if kw["competition_level"]=="HIGH" and kw["search_volume"]>1000
-                                    else "Easy" if kw["competition_level"]=="LOW" or kw["search_volume"]<100
-                                    else "Medium")
-        is_br = kw.get("is_brand_keyword",0); comp = kw["competition_level"]; intent = kw["intent"]
-        if is_br:                                                           kw["keyword_category"] = "branded"
-        elif comp=="HIGH" and intent in ("transactional","commercial"):     kw["keyword_category"] = "high_competition_commercial"
-        elif comp=="HIGH":                                                  kw["keyword_category"] = "high_competition"
+        kw["keyword_difficulty"] = (
+            "Hard"   if kw["competition_level"] == "HIGH" and kw["search_volume"] > 1000 else
+            "Easy"   if kw["competition_level"] == "LOW"  or  kw["search_volume"] < 100  else
+            "Medium"
+        )
+        is_br  = kw.get("is_brand_keyword", 0)
+        comp   = kw["competition_level"]
+        intent = kw["intent"]
+        if   is_br:                                                         kw["keyword_category"] = "branded"
+        elif comp == "HIGH" and intent in ("transactional","commercial"):   kw["keyword_category"] = "high_competition_commercial"
+        elif comp == "HIGH":                                                kw["keyword_category"] = "high_competition"
         elif intent in ("transactional","commercial"):                      kw["keyword_category"] = "commercial"
-        elif intent=="informational":                                       kw["keyword_category"] = "informational"
-        elif comp=="LOW":                                                   kw["keyword_category"] = "low_competition_opportunity"
+        elif intent == "informational":                                     kw["keyword_category"] = "informational"
+        elif comp == "LOW":                                                 kw["keyword_category"] = "low_competition_opportunity"
         else:                                                               kw["keyword_category"] = "medium_competition"
-    logger.info(f"ai_keyword_planner_pipeline: {len(keywords_full)} keywords ranked")
-    return keywords_full
 
+    source = "Google Ads" if google_ads_used else "AI-estimated"
+    high = sum(1 for k in keywords_full if k["competition_level"] == "HIGH")
+    med  = sum(1 for k in keywords_full if k["competition_level"] == "MEDIUM")
+    low  = sum(1 for k in keywords_full if k["competition_level"] == "LOW")
+    logger.info(f"keyword_planner done [{source}]: {len(keywords_full)} | High:{high} Med:{med} Low:{low}")
+    return keywords_full
 
 def ai_generate_llm_prompts(keyword_data: dict, keywords_ranked: list,
                              brand_name: str, location: str = "Global") -> list:

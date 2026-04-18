@@ -257,6 +257,28 @@ def _check_file(domain, path, sitemap_urls_out=None):
     return "Not Found"
 
 
+def _save_screenshot_proper(b64_data: str, output_path: str,
+                             target_width: int = 800, target_height: int = 450):
+    """Save PageSpeed screenshot with correct dimensions — no stretching."""
+    try:
+        from PIL import Image as PILImage
+        import base64 as _b64, io as _io
+        img_bytes = _b64.b64decode(b64_data)
+        img       = PILImage.open(_io.BytesIO(img_bytes))
+        orig_w, orig_h = img.size
+        ratio  = min(target_width / orig_w, target_height / orig_h)
+        new_w  = int(orig_w * ratio)
+        new_h  = int(orig_h * ratio)
+        img    = img.resize((new_w, new_h), PILImage.LANCZOS)
+        canvas = PILImage.new("RGB", (target_width, target_height), (255, 255, 255))
+        canvas.paste(img, ((target_width - new_w) // 2, 0))
+        canvas.save(output_path, "JPEG", quality=85)
+        return output_path
+    except Exception as e:
+        logger.error(f"Screenshot save error: {e}")
+        return None
+
+
 def _get_pagespeed(url, strategy):
     """Fetch PageSpeed Insights. Works without API key (free tier); key adds higher quota."""
     try:
@@ -277,11 +299,17 @@ def _get_pagespeed(url, strategy):
         audits = lh.get("audits", {})
         perf = lh.get("categories", {}).get("performance", {}).get("score")
         score = int(perf * 100) if perf is not None else "N/A"
+        # Extract screenshot b64 data (used by PDF export)
+        screenshot = None
+        ss_data = audits.get("final-screenshot", {}).get("details", {}).get("data", "")
+        if ss_data and "," in ss_data:
+            screenshot = ss_data.split(",")[1]
         return {
-            "score": score,
-            "lcp": audits.get("largest-contentful-paint", {}).get("displayValue", "N/A"),
-            "cls": audits.get("cumulative-layout-shift", {}).get("displayValue", "N/A"),
-            "fcp": audits.get("first-contentful-paint", {}).get("displayValue", "N/A"),
+            "score":      score,
+            "lcp":        audits.get("largest-contentful-paint", {}).get("displayValue", "N/A"),
+            "cls":        audits.get("cumulative-layout-shift",  {}).get("displayValue", "N/A"),
+            "fcp":        audits.get("first-contentful-paint",   {}).get("displayValue", "N/A"),
+            "screenshot": screenshot,
         }
     except Exception as e:
         logger.error(f"PageSpeed [{strategy}] {url}: {e}")
@@ -344,6 +372,88 @@ def _analyze_page_schema(url: str, html_text: str) -> dict:
         "missing_schemas":      missing,
     }
 
+# ── Playwright / JS Browser rendering ────────────────────────────────────────
+USE_BROWSER     = False
+browser_context = None
+
+
+def _setup_browser() -> bool:
+    """
+    Try to set up Playwright headless Chromium for JS-rendered sites.
+    Returns True if successful, False otherwise.
+    Install: pip3 install playwright && python3 -m playwright install chromium
+    """
+    global USE_BROWSER, browser_context
+    try:
+        from playwright.sync_api import sync_playwright
+        pw      = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        browser_context = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1280, "height": 720},
+            ignore_https_errors=True,
+        )
+        USE_BROWSER = True
+        logger.info("Playwright browser ready.")
+        return True
+    except ImportError:
+        logger.warning("Playwright not installed. "
+                       "Run: pip3 install playwright && python3 -m playwright install chromium")
+        return False
+    except Exception as e:
+        logger.warning(f"Browser setup error: {e}")
+        return False
+
+
+def _fetch_with_browser(url: str, timeout: int = 30):
+    """
+    Fetch a URL using headless browser (renders JavaScript).
+    Returns (status_code, html_text) or (None, None) on failure.
+    """
+    if not USE_BROWSER or not browser_context:
+        return None, None
+    try:
+        page = browser_context.new_page()
+        page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+        html   = page.content()
+        status = 200
+        page.close()
+        return status, html
+    except Exception as e:
+        logger.error(f"Browser fetch error {url}: {e}")
+        try:
+            page.close()
+        except Exception:
+            pass
+        return None, None
+
+
+def _is_js_rendered(html_text: str) -> bool:
+    """
+    Detect if a page is a JavaScript-rendered SPA (React/Next.js/Vue/Angular)
+    with little or no server-side HTML.
+    """
+    if not html_text:
+        return True
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html_text, "html.parser")
+    body = soup.find("body")
+    if not body:
+        return True
+    body_text = body.get_text(strip=True)
+    js_markers = [
+        "__NEXT_DATA__", "__NUXT__", 'id="root"', 'id="app"',
+        'id="__next"', "ng-app", "data-reactroot",
+    ]
+    has_js_markers = any(m in html_text for m in js_markers)
+    if len(body_text) < 100 and has_js_markers:
+        return True
+    links = soup.find_all("a", href=True)
+    if len(links) < 3 and has_js_markers:
+        return True
+    return False
+
+
 def _crawl_page(url, base_url, domain, pages_list, images_list,
                 pending_links, content_hash_map, pages_lock, images_lock, broken_lock):
     from bs4 import BeautifulSoup
@@ -352,23 +462,36 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
     pd["url"] = url
     pd["url_cleaned"] = _url_cleanup(url)
     new_links = []
+    html_text = None
+    status    = None
+    response_headers = {}
+    used_browser = False
 
+    # ── Step 1: Normal requests fetch ────────────────────────────────────────
     try:
         r = _safe_get(url, timeout=CRAWL_TIMEOUT)
-        status = r.status_code
-        html_text = r.text
+        status           = r.status_code
+        html_text        = r.text
         response_headers = dict(r.headers)
     except Exception as e:
         err_str = str(e)
-        if "Timeout" in err_str or "timed out" in err_str.lower():
-            pd["status"] = "Timeout — server took too long to respond"
-        elif "ConnectionError" in err_str or "Connection" in err_str:
-            pd["status"] = "Connection Error - server refused/DNS failed/SSL issue"
-        else:
-            pd["status"] = f"Error: {err_str[:80]}"
-        with pages_lock:
-            pages_list.append(pd)
-        return []
+        # Try browser as fallback on timeout/connection error
+        if USE_BROWSER:
+            bs, bhtml = _fetch_with_browser(url, timeout=CRAWL_TIMEOUT)
+            if bs and bhtml:
+                status       = bs
+                html_text    = bhtml
+                used_browser = True
+        if not html_text:
+            if "Timeout" in err_str or "timed out" in err_str.lower():
+                pd["status"] = "Timeout — server took too long to respond"
+            elif "ConnectionError" in err_str or "Connection" in err_str:
+                pd["status"] = "Connection Error - server refused/DNS failed/SSL issue"
+            else:
+                pd["status"] = f"Error: {err_str[:80]}"
+            with pages_lock:
+                pages_list.append(pd)
+            return []
 
     pd["status"] = status
 
@@ -380,7 +503,6 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
         return []
 
     if isinstance(status, int) and status >= 500:
-        # Retry once for transient 500 errors (mirrors old crawl() behaviour)
         try:
             import time as _time
             _time.sleep(2)
@@ -390,7 +512,6 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
                 status           = 200
                 response_headers = dict(r2.headers)
                 pd["status"]     = "200 (recovered from 500)"
-                # fall through to full 200 parse below
             else:
                 pd["status"] = status
                 with pages_lock:
@@ -404,10 +525,19 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
 
     if status != 200:
         if isinstance(status, int) and status in (301, 302, 307, 308):
-            pd["redirect_target"] = r.url
+            pd["redirect_target"] = r.url if not used_browser else url
         with pages_lock:
             pages_list.append(pd)
         return []
+
+    # ── Step 2: If page looks JS-rendered, re-fetch with browser ─────────────
+    if not used_browser and html_text and _is_js_rendered(html_text) and USE_BROWSER:
+        bs, bhtml = _fetch_with_browser(url, timeout=CRAWL_TIMEOUT)
+        if bs and bhtml and len(bhtml) > len(html_text):
+            html_text    = bhtml
+            status       = bs
+            used_browser = True
+            logger.debug(f"Browser re-render used for {url}")
 
     # ── 200 OK: full parse ────────────────────────────────────────────────────
     try:
@@ -422,11 +552,11 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
             return []
 
     text_content = _clean(soup.get_text())
-    word_count = len(text_content.split())
-    page_source = html_text
+    word_count   = len(text_content.split())
+    page_source  = html_text
 
     # Canonical
-    can_tag = soup.find("link", rel="canonical")
+    can_tag  = soup.find("link", rel="canonical")
     can_href = can_tag.get("href") if can_tag else None
     pd["canonical_status"] = _canonical_check(url, can_href)
     pd["canonical_url"]    = can_href or "Not Set"
@@ -675,28 +805,64 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
 
     setup_ai_clients(ai_mode)
 
-    # Resolve URL
+    # ── Step 1: Resolve URL (MUST happen before JS detection) ────────────────
     if not input_url.startswith("http"):
         input_url = "https://" + input_url
-    base_url = _resolve_base_url(input_url)
-    parsed   = urlparse(base_url)
-    domain   = parsed.netloc
+    base_url  = _resolve_base_url(input_url)
+    parsed    = urlparse(base_url)
+    domain    = parsed.netloc
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger.info(f"Resolved URL: {base_url}  domain: {domain}")
 
-    logger.info(f"Resolved URL: {base_url} domain: {domain}")
+    # ── Step 2: JS detection + Playwright browser setup ──────────────────────
+    try:
+        test_r = _safe_get(base_url, timeout=20)
+        if test_r and test_r.status_code == 200 and _is_js_rendered(test_r.text):
+            logger.info("Site appears JS-rendered (React/Next.js/Vue). Setting up headless browser...")
+            if _setup_browser():
+                logger.info("Playwright browser ENABLED — will render JS pages.")
+            else:
+                logger.warning("Playwright unavailable — JS pages may have limited content. "
+                               "Run: pip3 install playwright && python3 -m playwright install chromium")
+        else:
+            logger.info("Site serves static HTML — standard crawling mode.")
+    except Exception as _js_e:
+        logger.warning(f"JS detection failed ({_js_e}) — attempting browser as fallback...")
+        if _setup_browser():
+            bs, bhtml = _fetch_with_browser(base_url, timeout=30)
+            if bs and bhtml:
+                logger.info("Browser successfully loaded the site.")
 
-    # Create DB record
+    # ── Step 3: Create or RESUME DB audit record ─────────────────────────────
+    # If a previous run for this domain crashed mid-crawl (audit_status='in_progress'),
+    # we reload already-crawled pages and skip those URLs — no data lost.
+    from db import db_find_existing_audit, db_get_crawled_urls, db_query_pages
+    already_crawled: set = set()
+    pages_list_preloaded: list = []
+
     conn = get_db_conn()
     try:
-        audit_id = db_create_audit(conn, brand_id, {
-            "domain": domain, "base_url": base_url,
-            "target_location": target_location or "Global",
-            "business_type": business_type or "",
-            "ai_mode": ai_mode,
-        })
+        existing = db_find_existing_audit(conn, domain)
+        if existing:
+            prev_id = existing["id"] if isinstance(existing, dict) else existing[0]
+            logger.info(f"Found in-progress audit #{prev_id} for {domain} — resuming...")
+            audit_id = prev_id
+            already_crawled = db_get_crawled_urls(conn, audit_id)
+            if already_crawled:
+                prev_pages = db_query_pages(conn, audit_id)
+                pages_list_preloaded = [dict(p) for p in prev_pages] if prev_pages else []
+                logger.info(f"Resume: {len(already_crawled)} URLs already crawled, "
+                            f"{len(pages_list_preloaded)} pages loaded from DB")
+        else:
+            audit_id = db_create_audit(conn, brand_id, {
+                "domain": domain, "base_url": base_url,
+                "target_location": target_location or "Global",
+                "business_type": business_type or "",
+                "ai_mode": ai_mode,
+            })
+            logger.info(f"Created new audit #{audit_id}")
     finally:
         release_db_conn(conn)
-    logger.info(f"Created audit #{audit_id}")
 
     # Global file checks
     sitemap_urls_found = []
@@ -723,6 +889,15 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     pages_lock       = Lock()
     images_lock      = Lock()
     broken_lock      = Lock()
+
+    # ── Resume: preload previously crawled pages + skip their URLs ────────────
+    if pages_list_preloaded:
+        from collections import OrderedDict
+        for pp in pages_list_preloaded:
+            pages_list.append(pp)
+        logger.info(f"Preloaded {len(pages_list_preloaded)} pages from previous run")
+    for u in already_crawled:
+        visited.add(_normalize(u))
 
     # ── BFS Crawl ─────────────────────────────────────────────────────────────
     logger.info(f"Starting crawl (limit={crawl_limit})...")
@@ -754,6 +929,33 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
                 try:
                     new_links = f.result()
                     parent_depth = batch_depths.get(crawled_url, 0)
+
+                    # ── Save this page to DB immediately (crash-safe) ─────────
+                    if crawled_url not in already_crawled:
+                        page_data = None
+                        with pages_lock:
+                            for p in reversed(pages_list):
+                                if p.get("url") == crawled_url:
+                                    page_data = p
+                                    break
+                        if page_data:
+                            _pc = get_db_conn()
+                            try:
+                                db_insert_page(_pc, audit_id, page_data)
+                                page_imgs = [img for img in images_list
+                                             if img.get("page") == crawled_url]
+                                if page_imgs:
+                                    db_insert_images_batch(_pc, audit_id, page_imgs)
+                                db_mark_url_progress(_pc, audit_id, crawled_url,
+                                                     "crawled", str(page_data.get("status", "")))
+                                already_crawled.add(crawled_url)
+                            except Exception as _dbe:
+                                logger.error(f"DB immediate save error ({crawled_url[:60]}): {_dbe}")
+                                try: _pc.rollback()
+                                except Exception: pass
+                            finally:
+                                release_db_conn(_pc)
+
                     for u in new_links:
                         if u not in visited:
                             child_depth = parent_depth + 1
@@ -807,25 +1009,28 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     # ── Location detection ─────────────────────────────────────────────────────
     detected_location = target_location or _detect_location(domain, pages_list, ai_mode)
 
-    # ── Save crawled pages to DB ───────────────────────────────────────────────
+    # ── Save any crawled pages NOT yet saved (fallback for pages missed by immediate save) ──
     saved_pages = 0
     failed_pages = 0
     for p in pages_list:
+        url = p.get("url", "")
+        if url in already_crawled:
+            continue   # already saved per-page during crawl — skip to avoid duplicate
         _conn = get_db_conn()
         try:
             db_insert_page(_conn, audit_id, p)
-            db_mark_url_progress(_conn, audit_id, p.get("url", ""), "crawled",
-                                 str(p.get("status", "")))
+            db_mark_url_progress(_conn, audit_id, url, "crawled", str(p.get("status", "")))
+            already_crawled.add(url)
             saved_pages += 1
         except Exception as e:
             failed_pages += 1
-            logger.error(f"DB page insert error ({p.get('url','')[:60]}): {e}")
+            logger.error(f"DB page insert error ({url[:60]}): {e}")
             try: _conn.rollback()
             except Exception: pass
         finally:
             release_db_conn(_conn)
 
-    logger.info(f"Pages saved to DB: {saved_pages} OK, {failed_pages} failed")
+    logger.info(f"Pages saved to DB: {saved_pages} new, {len(already_crawled)} total, {failed_pages} failed")
 
     if images_list:
         _conn = get_db_conn()
@@ -1205,6 +1410,18 @@ def _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespe
                 "desktop_cls":   str(desktop.get("cls",   "N/A")),
                 "desktop_fcp":   str(desktop.get("fcp",   "N/A")),
             })
+
+            # Save PageSpeed screenshot if available
+            ss_b64 = desktop.get("screenshot") or mobile.get("screenshot")
+            if ss_b64:
+                import os as _os
+                ss_dir = "screenshots"
+                _os.makedirs(ss_dir, exist_ok=True)
+                safe_name = re.sub(r"[^a-zA-Z0-9]", "_", url)[:80]
+                ss_path = _os.path.join(ss_dir, f"{safe_name}.jpg")
+                saved = _save_screenshot_proper(ss_b64, ss_path)
+                if saved:
+                    pd["_screenshot_path"] = saved
 
             # AEO FAQ + body copy guidance — first 50 pages only (cost control)
             if idx < 50:
