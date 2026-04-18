@@ -780,10 +780,10 @@ Return ONLY valid JSON array (no markdown):
     except Exception as e: logger.error(f"ai_new_page_suggestions: {e}"); return []
 
 
+# =============================================================================
+# GOOGLE ADS KEYWORD PLANNER
+# =============================================================================
 
-# =============================================================================
-# GOOGLE ADS KEYWORD PLANNER — Full Integration (ported from old monolith)
-# =============================================================================
 def get_env(key):
     value = os.getenv(key)
     if not value:
@@ -792,10 +792,10 @@ def get_env(key):
 
 GOOGLE_ADS_CONFIG = {
     "developer_token": get_env("GOOGLE_ADS_DEVELOPER_TOKEN"),
-    "client_id": get_env("GOOGLE_ADS_CLIENT_ID"),
-    "client_secret": get_env("GOOGLE_ADS_CLIENT_SECRET"),
-    "refresh_token": get_env("GOOGLE_ADS_REFRESH_TOKEN"),
-    "customer_id": get_env("GOOGLE_ADS_CUSTOMER_ID"),
+    "client_id":       get_env("GOOGLE_ADS_CLIENT_ID"),
+    "client_secret":   get_env("GOOGLE_ADS_CLIENT_SECRET"),
+    "refresh_token":   get_env("GOOGLE_ADS_REFRESH_TOKEN"),
+    "customer_id":     get_env("GOOGLE_ADS_CUSTOMER_ID"),
 }
 
 _google_ads_available = False
@@ -803,27 +803,27 @@ _google_ads_client    = None
 
 
 def setup_google_ads() -> bool:
-    """
-    Initialize Google Ads client for Keyword Planner API.
-    Called automatically inside keyword_planner_pipeline().
-    Install: pip install google-ads --break-system-packages
-    """
+    """Initialize Google Ads client for Keyword Planner API."""
     global _google_ads_available, _google_ads_client
+    if _google_ads_available:
+        return True
     try:
         from google.ads.googleads.client import GoogleAdsClient
         config = {
-            "developer_token": GOOGLE_ADS_CONFIG["developer_token"],
-            "client_id":       GOOGLE_ADS_CONFIG["client_id"],
-            "client_secret":   GOOGLE_ADS_CONFIG["client_secret"],
-            "refresh_token":   GOOGLE_ADS_CONFIG["refresh_token"],
-            "use_proto_plus":  True,
+            "developer_token":   GOOGLE_ADS_CONFIG["developer_token"],
+            "client_id":         GOOGLE_ADS_CONFIG["client_id"],
+            "client_secret":     GOOGLE_ADS_CONFIG["client_secret"],
+            "refresh_token":     GOOGLE_ADS_CONFIG["refresh_token"],
+            # FIX 1: login_customer_id is REQUIRED for KeywordPlanIdeaService
+            "login_customer_id": GOOGLE_ADS_CONFIG["customer_id"].replace("-", ""),
+            "use_proto_plus":    True,
         }
         _google_ads_client    = GoogleAdsClient.load_from_dict(config)
         _google_ads_available = True
         logger.info("Google Ads Keyword Planner: Connected.")
         return True
     except ImportError:
-        logger.warning("google-ads not installed. pip install google-ads --break-system-packages")
+        logger.warning("google-ads not installed. pip install google-ads")
         return False
     except Exception as e:
         logger.error(f"Google Ads setup error: {e}")
@@ -832,39 +832,34 @@ def setup_google_ads() -> bool:
 
 def get_keyword_metrics_google(keywords_list: list,
                                 language_id: str = "1000",
-                                geo_target: str  = "2356") -> dict:
-    """
-    Fetch real search volume, CPC, competition from Google Ads Keyword Planner API.
-    Returns dict keyed by lowercase keyword.
-    Falls back gracefully to {} if unavailable.
-    """
+                                geo_target:  str = "2356") -> dict:
+    """Fetch search volume, CPC, competition from Google Ads Keyword Planner API."""
     if not _google_ads_available or not _google_ads_client:
         return {}
     customer_id = GOOGLE_ADS_CONFIG["customer_id"].replace("-", "")
     results: dict = {}
     try:
         kp_service = _google_ads_client.get_service("KeywordPlanIdeaService")
-        kp_network  = _google_ads_client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
-        request     = _google_ads_client.get_type("GenerateKeywordIdeasRequest")
-        request.customer_id          = customer_id
-        request.language             = f"languageConstants/{language_id}"
-        request.geo_target_constants.append(f"geoTargetConstants/{geo_target}")
-        request.keyword_plan_network = kp_network
-        request.include_adult_keywords = False
-
-        comp_map = {0: "UNSPECIFIED", 1: "UNKNOWN", 2: "LOW", 3: "MEDIUM", 4: "HIGH"}
+        kp_network = _google_ads_client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
+        comp_map   = {0: "UNSPECIFIED", 1: "UNKNOWN", 2: "LOW", 3: "MEDIUM", 4: "HIGH"}
 
         for batch_start in range(0, len(keywords_list), 20):
             batch = keywords_list[batch_start: batch_start + 20]
-            request.keyword_seed.keywords.clear()
-            for kw in batch:
-                request.keyword_seed.keywords.append(kw)
             try:
+                # FIX 2: Build a fresh request per batch; use extend() not clear()+append()
+                request = _google_ads_client.get_type("GenerateKeywordIdeasRequest")
+                request.customer_id          = customer_id
+                request.language             = f"languageConstants/{language_id}"
+                request.keyword_plan_network = kp_network
+                request.include_adult_keywords = False
+                request.geo_target_constants.append(f"geoTargetConstants/{geo_target}")
+                # FIX 3: extend() works correctly across all proto-plus versions
+                request.keyword_seed.keywords.extend(batch)
+
                 response = kp_service.generate_keyword_ideas(request=request)
                 for idea in response.results:
-                    keyword = idea.text
-                    m       = idea.keyword_idea_metrics
-                    results[keyword.lower()] = {
+                    m = idea.keyword_idea_metrics
+                    results[idea.text.lower()] = {
                         "search_volume":     int(m.avg_monthly_searches or 0),
                         "cpc":               round(m.average_cpc_micros / 1_000_000, 2) if m.average_cpc_micros else 0.0,
                         "competition":       comp_map.get(int(m.competition), "UNKNOWN"),
@@ -872,9 +867,19 @@ def get_keyword_metrics_google(keywords_list: list,
                     }
                 logger.info(f"KW Planner batch {batch_start//20+1}: {len(batch)} keywords processed.")
                 import time; time.sleep(1)
+
             except Exception as be:
-                logger.error(f"KW Planner batch error: {be}")
+                err = str(be)
+                # FIX 4: Detect GRPC version mismatch — abort all batches immediately
+                if "GRPC target method" in err:
+                    logger.error(
+                        "Google Ads GRPC version mismatch — your library routes to a different "
+                        "API version than installed. Fix: pip3 install --upgrade google-ads"
+                    )
+                    return {}
+                logger.error(f"KW Planner batch error: {err[:200]}")
                 continue
+
     except Exception as e:
         logger.error(f"Google Ads Keyword Planner error: {e}")
     return results
@@ -902,18 +907,9 @@ GOOGLE_ADS_GEO_MAP = {
 
 
 def ai_keyword_planner_pipeline(keyword_data: dict, brand_name: str, location: str = "Global") -> list:
-    """
-    Full pipeline:
-      1. Collect seed keywords from crawler AI analysis
-      2. Expand to 100 keywords using AI
-      3. Try Google Ads Keyword Planner for REAL metrics (volume, CPC, competition)
-      4. Fall back to AI metric estimation if Google Ads unavailable
-      5. Rank by composite score and assign categories
-    """
     if not _has_client() and not keyword_data.get("services"):
         return []
 
-    # ── Step 1: Collect seed keywords ──────────────────────────────────────────
     all_keywords: set = set()
     service_map: dict = {}
     type_map:    dict = {}
@@ -936,7 +932,6 @@ def ai_keyword_planner_pipeline(keyword_data: dict, brand_name: str, location: s
                 service_map[kw] = svc_name
                 type_map.setdefault(kw, "service")
 
-    # Brand keywords
     for bkw in [brand_name, f"{brand_name} services", f"{brand_name} reviews",
                 f"{brand_name} pricing", f"{brand_name} near me",
                 f"{brand_name} {location}", f"{brand_name} alternatives",
@@ -946,7 +941,6 @@ def ai_keyword_planner_pipeline(keyword_data: dict, brand_name: str, location: s
             service_map[bkw] = "Brand"
             type_map[bkw]    = "brand"
 
-    # ── Step 2: AI expansion to 100 ────────────────────────────────────────────
     if len(all_keywords) < 100 and _has_client():
         needed        = 100 - len(all_keywords)
         services_list = ", ".join([s["service"] for s in keyword_data.get("services", [])])
@@ -970,14 +964,13 @@ Return ONLY JSON: [{{"keyword":"text","type":"primary|secondary|short_tail|long_
     keyword_list = list(all_keywords)[:100]
     logger.info(f"ai_keyword_planner_pipeline: {len(keyword_list)} keywords collected")
 
-    # ── Step 3: Google Ads metrics (real data) ──────────────────────────────────
     all_metrics: dict = {}
-    google_ads_used = False
+    google_ads_used   = False
 
-    setup_google_ads()          # no-op if already done or unavailable
+    setup_google_ads()
 
     if _google_ads_available:
-        geo_target = "2356"     # default India
+        geo_target = "2356"
         loc_lower  = location.lower()
         for loc_key, geo_id in GOOGLE_ADS_GEO_MAP.items():
             if loc_key in loc_lower:
@@ -985,11 +978,10 @@ Return ONLY JSON: [{{"keyword":"text","type":"primary|secondary|short_tail|long_
                 break
         google_metrics = get_keyword_metrics_google(keyword_list, geo_target=geo_target)
         if google_metrics:
-            all_metrics      = google_metrics
-            google_ads_used  = True
+            all_metrics    = google_metrics
+            google_ads_used = True
             logger.info(f"Google Ads metrics fetched for {len(google_metrics)} keywords")
 
-    # ── Step 4: AI fallback metric estimation ───────────────────────────────────
     if not google_ads_used:
         logger.info("Google Ads unavailable — using AI metric estimation fallback")
         for batch_start in range(0, len(keyword_list), 25):
@@ -1016,7 +1008,6 @@ Rules: search_volume=int, cpc=decimal, competition=HIGH|MEDIUM|LOW, intent=infor
             except Exception as e:
                 logger.error(f"ai_keyword_planner batch: {e}")
 
-    # ── Step 5: Build full keyword objects ──────────────────────────────────────
     keywords_full = []
     for kw in keyword_list:
         m        = all_metrics.get(kw.lower(), {})
@@ -1033,7 +1024,6 @@ Rules: search_volume=int, cpc=decimal, competition=HIGH|MEDIUM|LOW, intent=infor
             "intent":            m.get("intent", "informational"),
         })
 
-    # ── Step 6: Rank by composite score ────────────────────────────────────────
     max_vol   = max((k["search_volume"] for k in keywords_full), default=1) or 1
     max_cpc   = max((k["cpc"]           for k in keywords_full), default=1) or 1
     intent_sc = {"transactional": 1.0, "commercial": 0.8, "informational": 0.5, "navigational": 0.3}
@@ -1073,13 +1063,9 @@ Rules: search_volume=int, cpc=decimal, competition=HIGH|MEDIUM|LOW, intent=infor
     logger.info(f"keyword_planner done [{source}]: {len(keywords_full)} | High:{high} Med:{med} Low:{low}")
     return keywords_full
 
+
 def ai_generate_llm_prompts(keyword_data: dict, keywords_ranked: list,
                              brand_name: str, location: str = "Global") -> list:
-    """
-    Generate LLM prompts (questions users type into ChatGPT/Perplexity/Gemini).
-    5 categories: high_competition, informational, commercial, local, branded.
-    FIX: Restored full indentation and all 5 categories inside the function.
-    """
     if not _has_client() or not keywords_ranked:
         return []
 
@@ -1109,7 +1095,6 @@ def ai_generate_llm_prompts(keyword_data: dict, keywords_ranked: list,
             logger.error(f"llm_prompts {batch_name} error: {e}")
             return []
 
-    # ── CATEGORY 1: High Competition ──────────────────────────────────────────
     if high_comp:
         kw_list = "\n".join(
             f"- \"{k['keyword']}\" (Vol:{k['search_volume']}, Service:{k.get('service_name','')})"
@@ -1134,7 +1119,6 @@ Examples: "best [keyword] in [location]", "top [keyword] companies [location]", 
 Return ONLY JSON array (no markdown, no explanation):
 [{{"prompt_text":"exact prompt","prompt_type":"high_competition","target_keyword":"keyword used","search_volume":1000,"ai_engine":"All","service_name":"Service","priority":"high","keyword_category":"high_competition"}}]""", "high_competition"))
 
-    # ── CATEGORY 2: Informational ─────────────────────────────────────────────
     if info_kws:
         kw_list = "\n".join(f"- \"{k['keyword']}\" (Vol:{k['search_volume']})" for k in info_kws)
         all_prompts.extend(_call(f"""Generate INFORMATIONAL search prompts. Users seeking knowledge/education about these topics.
@@ -1153,7 +1137,6 @@ RULES:
 Return ONLY JSON array:
 [{{"prompt_text":"text","prompt_type":"informational","target_keyword":"kw","search_volume":500,"ai_engine":"All","service_name":"service","priority":"medium","keyword_category":"informational"}}]""", "informational"))
 
-    # ── CATEGORY 3: Commercial / Transactional ────────────────────────────────
     if commercial_kws:
         kw_list = "\n".join(f"- \"{k['keyword']}\" (Vol:{k['search_volume']})" for k in commercial_kws)
         all_prompts.extend(_call(f"""Generate COMMERCIAL/TRANSACTIONAL search prompts. Users ready to buy or hire.
@@ -1172,7 +1155,6 @@ RULES:
 Return ONLY JSON array:
 [{{"prompt_text":"text","prompt_type":"commercial","target_keyword":"kw","search_volume":500,"ai_engine":"All","service_name":"service","priority":"high","keyword_category":"commercial"}}]""", "commercial"))
 
-    # ── CATEGORY 4: Local / Geo ───────────────────────────────────────────────
     if location and location != "Global" and high_vol[:8]:
         local_kws = high_vol[:8]
         kw_list = "\n".join(f"- \"{k['keyword']}\"" for k in local_kws)
@@ -1190,7 +1172,6 @@ RULES:
 Return ONLY JSON array:
 [{{"prompt_text":"text","prompt_type":"local","target_keyword":"kw","search_volume":300,"ai_engine":"All","service_name":"service","priority":"medium","keyword_category":"local"}}]""", "local"))
 
-    # ── CATEGORY 5: Branded ───────────────────────────────────────────────────
     if branded[:10]:
         branded_list = "\n".join(f"- \"{k['keyword']}\" (Vol:{k.get('search_volume',0)})" for k in branded[:10])
         all_prompts.extend(_call(f"""Generate BRANDED search prompts for "{brand_name}". These are prompts where users specifically search for this brand on AI platforms.
@@ -1214,7 +1195,6 @@ Every prompt MUST contain "{brand_name}".
 Return ONLY JSON array:
 [{{"prompt_text":"text with {brand_name}","prompt_type":"branded","target_keyword":"kw","search_volume":100,"ai_engine":"All","service_name":"service","priority":"high","keyword_category":"branded"}}]""", "branded"))
 
-    # ── Deduplicate + enforce brand-safety rules ───────────────────────────────
     seen = set()
     final = []
     for p in all_prompts:
@@ -1225,7 +1205,7 @@ Return ONLY JSON array:
         seen.add(text_lower)
         cat = p.get("keyword_category", p.get("prompt_type","general"))
         if cat != "branded" and brand_lower in text_lower:
-            continue  # non-branded must not leak brand name
+            continue
         p["suggested_answer"] = ""
         vol = p.get("search_volume", 0)
         try: vol = int(vol)
