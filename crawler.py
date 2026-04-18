@@ -638,14 +638,18 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
     img_total = 0
     img_missing = 0
     page_imgs = []
-    for img in soup.find_all("img"):
-        img_total += 1
+    all_imgs = soup.find_all("img")
+    img_total = len(all_imgs)
+    # Count all for stats, but only store first 100 per page in DB (memory safety)
+    for img in all_imgs:
+        alt = (img.get("alt") or "").strip()
+        if not alt:
+            img_missing += 1
+    for img in all_imgs[:100]:
         alt = (img.get("alt") or "").strip()
         raw_src = img.get("src") or img.get("data-src") or ""
         full_src = urljoin(url, raw_src.strip()) if raw_src else "(no src)"
         has_alt = bool(alt)
-        if not has_alt:
-            img_missing += 1
         page_imgs.append({
             "page": url, "src": full_src[:2000],
             "alt": alt, "alt_status": "Present" if has_alt else "Missing"
@@ -777,6 +781,142 @@ def _crawl_page(url, base_url, domain, pages_list, images_list,
 
 # ── Main Orchestrator ─────────────────────────────────────────────────────────
 
+
+
+def _fetch_sitemap_urls_all(domain: str, max_urls: int = 50000) -> list:
+    """
+    Recursively fetch ALL URLs from sitemap.xml + sitemap index files.
+    Handles: sitemap index → multiple child sitemaps → all <loc> URLs.
+    Returns list of URLs in sitemap order.
+    """
+    import xml.etree.ElementTree as ET
+    NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+    collected: list      = []
+    visited_sitemaps: set = set()
+
+    def _parse_sitemap(url: str, depth: int = 0):
+        if url in visited_sitemaps or len(collected) >= max_urls or depth > 5:
+            return
+        visited_sitemaps.add(url)
+        try:
+            r = _safe_get(url, timeout=20)
+            if not r or r.status_code != 200:
+                return
+            content = r.text.strip()
+            if not content:
+                return
+            root = ET.fromstring(content)
+            tag  = root.tag.lower()
+            if "sitemapindex" in tag:
+                child_locs = root.findall(f".//{{{NS}}}loc") or root.findall(".//loc")
+                logger.info(f"Sitemap index at {url}: {len(child_locs)} child sitemaps")
+                for loc in child_locs:
+                    if loc.text and len(collected) < max_urls:
+                        _parse_sitemap(loc.text.strip(), depth + 1)
+            else:
+                locs = root.findall(f".//{{{NS}}}loc") or root.findall(".//loc")
+                for loc in locs:
+                    if loc.text and len(collected) < max_urls:
+                        collected.append(loc.text.strip())
+        except Exception as e:
+            logger.debug(f"Sitemap parse error {url}: {e}")
+
+    # Check robots.txt for Sitemap: directive first
+    candidates = []
+    try:
+        robots = _safe_get(f"https://{domain}/robots.txt", timeout=10)
+        if robots and robots.status_code == 200:
+            for line in robots.text.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    sm_url = line.split(":", 1)[1].strip()
+                    if sm_url:
+                        candidates.append(sm_url)
+    except Exception:
+        pass
+
+    # Fallback candidates
+    for path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemaps.xml"]:
+        for scheme in ["https", "http"]:
+            url = f"{scheme}://{domain}{path}"
+            if url not in candidates:
+                candidates.append(url)
+
+    for sm_url in candidates:
+        if sm_url not in visited_sitemaps:
+            _parse_sitemap(sm_url)
+        if collected:
+            break   # found a working sitemap — stop trying alternatives
+
+    logger.info(f"Sitemap fetch: {len(collected)} URLs from {len(visited_sitemaps)} sitemaps")
+    return collected
+
+
+def _smart_sample_urls(sitemap_urls: list, base_url: str, crawl_limit: int) -> list:
+    """
+    For sites with more pages than crawl_limit: select a representative sample.
+
+    Strategy:
+      - Homepage always first
+      - Group all URLs by top-level section (/products/, /blog/, /about/, etc.)
+      - Allocate slots evenly across sections
+      - Fill any remaining slots from largest sections
+
+    Example: 50,000 URL site, crawl_limit=500, 20 sections
+      → 24 pages per section + homepage = representative coverage of whole site
+    """
+    from urllib.parse import urlparse
+
+    if len(sitemap_urls) <= crawl_limit:
+        return sitemap_urls   # site is small enough — crawl everything
+
+    homepage     = base_url.rstrip("/")
+    base_domain  = urlparse(base_url).netloc
+
+    # Group by top-level path section
+    sections: dict = {}
+    for url in sitemap_urls:
+        p       = urlparse(url)
+        if p.netloc != base_domain:
+            continue
+        parts   = [x for x in p.path.strip("/").split("/") if x]
+        section = parts[0] if parts else "_root"
+        sections.setdefault(section, []).append(url)
+
+    if not sections:
+        return sitemap_urls[:crawl_limit]
+
+    # Always start with homepage
+    selected     = []
+    already_have = set()
+    if homepage:
+        selected.append(homepage)
+        already_have.add(homepage)
+
+    num_sections      = len(sections)
+    slots_per_section = max(1, (crawl_limit - 1) // num_sections)
+
+    # Round 1: take up to slots_per_section from each section
+    for section, urls in sorted(sections.items()):
+        for url in urls[:slots_per_section]:
+            if url not in already_have and len(selected) < crawl_limit:
+                selected.append(url)
+                already_have.add(url)
+
+    # Round 2: fill remaining slots from sections with most URLs (deeper coverage)
+    if len(selected) < crawl_limit:
+        all_remaining = [u for u in sitemap_urls
+                         if u not in already_have and urlparse(u).netloc == base_domain]
+        for url in all_remaining:
+            if len(selected) >= crawl_limit:
+                break
+            selected.append(url)
+
+    logger.info(
+        f"Smart sample: {len(sitemap_urls):,} sitemap URLs → {len(selected)} selected "
+        f"({num_sections} sections, ~{slots_per_section}/section, limit={crawl_limit})"
+    )
+    return selected
+
 def run_audit(input_url: str, brand_id: int, target_location: str = "",
               business_type: str = "", ai_mode: str = "1", crawl_limit: int = 100,
               run_pagespeed: bool = False) -> dict:
@@ -900,15 +1040,38 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
         visited.add(_normalize(u))
 
     # ── BFS Crawl ─────────────────────────────────────────────────────────────
-    logger.info(f"Starting crawl (limit={crawl_limit})...")
-    queue = [(_normalize(base_url), 0)]
-    crawl_depth_map[_normalize(base_url)] = 0
+    # ── Large-site smart seeding ───────────────────────────────────────────────
+    # If sitemap has more URLs than crawl_limit, fetch full sitemap and sample it
+    # so we crawl a representative cross-section rather than just the first N links
+    # from the homepage. For small sites (<= crawl_limit URLs), crawl normally.
+    if len(sitemap_urls_found) > crawl_limit:
+        logger.info(f"Large site detected: {len(sitemap_urls_found):,} sitemap URLs, "
+                    f"crawl_limit={crawl_limit}. Fetching full sitemap for smart sampling...")
+        all_sitemap_urls = _fetch_sitemap_urls_all(domain, max_urls=100000)
+        if not all_sitemap_urls:
+            all_sitemap_urls = sitemap_urls_found   # fallback to what we already have
+        sampled_urls = _smart_sample_urls(all_sitemap_urls, base_url, crawl_limit)
+        # Seed BFS queue with sampled URLs — these will be crawled in order
+        logger.info(f"BFS seeded with {len(sampled_urls)} sampled URLs from sitemap")
+        seed_urls  = [(_normalize(u), 0) for u in sampled_urls]
+        queue      = seed_urls
+        for u, _ in seed_urls:
+            crawl_depth_map[u] = 0
+    else:
+        # Normal site — seed BFS from homepage only, let links drive discovery
+        queue = [(_normalize(base_url), 0)]
+        crawl_depth_map[_normalize(base_url)] = 0
+
+    logger.info(f"Starting crawl (limit={crawl_limit}, queue_seed={len(queue)})...")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        while queue and len(visited) < crawl_limit:
+        while queue and len(pages_list) < crawl_limit:
             batch = []
             batch_depths = {}
             while queue and len(batch) < MAX_WORKERS:
+                # Stop adding to batch if we already have enough pages
+                if len(pages_list) + len(batch) >= crawl_limit:
+                    break
                 u, depth = queue.pop(0)
                 if u not in visited:
                     visited.add(u)

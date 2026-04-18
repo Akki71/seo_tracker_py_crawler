@@ -62,7 +62,7 @@ class AuditRequest(BaseModel):
     target_location: Optional[str] = ""
     business_type: Optional[str] = ""   # e.g. "agency", "ecommerce", "saas", "local"
     ai_mode: Optional[str] = "1"        # 1=OpenAI 2=Claude 3=Hybrid 4=Skip AI
-    crawl_limit: Optional[int] = 100
+    crawl_limit: Optional[int] = 500
     run_pagespeed: Optional[bool] = False
 
 class AuditStatusResponse(BaseModel):
@@ -160,7 +160,7 @@ async def start_audit(req: AuditRequest, background_tasks: BackgroundTasks):
     if req.brand_id <= 0:
         raise HTTPException(status_code=400, detail="brand_id must be a positive integer")
 
-    crawl_limit = min(max(req.crawl_limit or 100, 1), 500)
+    crawl_limit = min(max(req.crawl_limit or 500, 1), 10000)
 
     job_id = str(uuid.uuid4())
     now    = datetime.utcnow().isoformat()
