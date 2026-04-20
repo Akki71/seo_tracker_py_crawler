@@ -362,12 +362,169 @@ def _analyze_page_schema(url: str, html_text: str) -> dict:
     recommended = list(set(recommended))
     missing = [s for s in recommended if s not in found]
     status = "Missing" if not found else ("Partial" if missing else "Complete")
+
+    # ── Generate actual JSON-LD snippets for each missing schema type ──
+    parsed_domain = urlparse(url).netloc
+    page_name     = urlparse(url).path.strip("/").replace("-", " ").replace("/", " ").title() or "Home"
+    recommended_snippets = []
+    SCHEMA_TEMPLATES = {
+        "WebPage": {
+            "@context": "https://schema.org",
+            "@type": "WebPage",
+            "url": url,
+            "name": page_name,
+            "description": "",
+        },
+        "WebSite": {
+            "@context": "https://schema.org",
+            "@type": "WebSite",
+            "url": f"https://{parsed_domain}/",
+            "name": parsed_domain.replace("www.", "").split(".")[0].title(),
+            "potentialAction": {
+                "@type": "SearchAction",
+                "target": f"https://{parsed_domain}/?s={{search_term_string}}",
+                "query-input": "required name=search_term_string",
+            },
+        },
+        "Organization": {
+            "@context": "https://schema.org",
+            "@type": "Organization",
+            "name": parsed_domain.replace("www.", "").split(".")[0].title(),
+            "url": f"https://{parsed_domain}/",
+            "logo": f"https://{parsed_domain}/logo.png",
+            "contactPoint": {
+                "@type": "ContactPoint",
+                "telephone": "+1-000-000-0000",
+                "contactType": "customer service",
+            },
+        },
+        "LocalBusiness": {
+            "@context": "https://schema.org",
+            "@type": "LocalBusiness",
+            "name": parsed_domain.replace("www.", "").split(".")[0].title(),
+            "url": f"https://{parsed_domain}/",
+            "telephone": "+1-000-000-0000",
+            "address": {
+                "@type": "PostalAddress",
+                "streetAddress": "123 Main St",
+                "addressLocality": "City",
+                "addressRegion": "State",
+                "postalCode": "00000",
+                "addressCountry": "US",
+            },
+        },
+        "ContactPage": {
+            "@context": "https://schema.org",
+            "@type": "ContactPage",
+            "url": url,
+            "name": page_name,
+        },
+        "AboutPage": {
+            "@context": "https://schema.org",
+            "@type": "AboutPage",
+            "url": url,
+            "name": page_name,
+        },
+        "Service": {
+            "@context": "https://schema.org",
+            "@type": "Service",
+            "name": page_name,
+            "url": url,
+            "provider": {
+                "@type": "Organization",
+                "name": parsed_domain.replace("www.", "").split(".")[0].title(),
+            },
+            "description": "",
+        },
+        "Product": {
+            "@context": "https://schema.org",
+            "@type": "Product",
+            "name": page_name,
+            "url": url,
+            "offers": {
+                "@type": "Offer",
+                "priceCurrency": "USD",
+                "price": "0.00",
+                "availability": "https://schema.org/InStock",
+            },
+        },
+        "Article": {
+            "@context": "https://schema.org",
+            "@type": "Article",
+            "headline": page_name,
+            "url": url,
+            "author": {"@type": "Person", "name": "Author Name"},
+            "publisher": {
+                "@type": "Organization",
+                "name": parsed_domain.replace("www.", "").split(".")[0].title(),
+                "logo": {"@type": "ImageObject", "url": f"https://{parsed_domain}/logo.png"},
+            },
+            "datePublished": "",
+            "dateModified": "",
+        },
+        "BlogPosting": {
+            "@context": "https://schema.org",
+            "@type": "BlogPosting",
+            "headline": page_name,
+            "url": url,
+            "author": {"@type": "Person", "name": "Author Name"},
+            "datePublished": "",
+            "dateModified": "",
+        },
+        "FAQPage": {
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": [
+                {"@type": "Question", "name": "Question 1?",
+                 "acceptedAnswer": {"@type": "Answer", "text": "Answer 1."}},
+                {"@type": "Question", "name": "Question 2?",
+                 "acceptedAnswer": {"@type": "Answer", "text": "Answer 2."}},
+            ],
+        },
+        "BreadcrumbList": {
+            "@context": "https://schema.org",
+            "@type": "BreadcrumbList",
+            "itemListElement": [
+                {"@type": "ListItem", "position": 1, "name": "Home",
+                 "item": f"https://{parsed_domain}/"},
+                {"@type": "ListItem", "position": 2, "name": page_name,
+                 "item": url},
+            ],
+        },
+        "PriceSpecification": {
+            "@context": "https://schema.org",
+            "@type": "PriceSpecification",
+            "priceCurrency": "USD",
+            "price": "0.00",
+        },
+        "Offer": {
+            "@context": "https://schema.org",
+            "@type": "Offer",
+            "url": url,
+            "priceCurrency": "USD",
+            "price": "0.00",
+            "availability": "https://schema.org/InStock",
+        },
+    }
+    for schema_type in missing:
+        tmpl = SCHEMA_TEMPLATES.get(schema_type)
+        if tmpl:
+            recommended_snippets.append(json.dumps(tmpl, indent=2))
+        else:
+            # Generic fallback for unknown types
+            recommended_snippets.append(json.dumps({
+                "@context": "https://schema.org",
+                "@type": schema_type,
+                "url": url,
+                "name": page_name,
+            }, indent=2))
+
     return {
         "page_url":             url,
         "schema_types_found":   found,
         "schema_snippets":      snippets,
         "recommended_schemas":  recommended,
-        "recommended_snippets": [],
+        "recommended_snippets": recommended_snippets,
         "schema_status":        status,
         "missing_schemas":      missing,
     }
@@ -1025,7 +1182,8 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     broken_links_list = []
     pending_links    = []
     content_hash_map = {}
-    crawl_depth_map  = {}
+    crawl_depth_map  = {}   # url -> depth level (int)
+    parent_url_map   = {}   # url -> parent url that linked to it
     pages_lock       = Lock()
     images_lock      = Lock()
     broken_lock      = Lock()
@@ -1057,10 +1215,12 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
         queue      = seed_urls
         for u, _ in seed_urls:
             crawl_depth_map[u] = 0
+            parent_url_map[u]  = ""   # sitemap-seeded pages have no parent
     else:
         # Normal site — seed BFS from homepage only, let links drive discovery
         queue = [(_normalize(base_url), 0)]
         crawl_depth_map[_normalize(base_url)] = 0
+        parent_url_map[_normalize(base_url)]  = ""
 
     logger.info(f"Starting crawl (limit={crawl_limit}, queue_seed={len(queue)})...")
 
@@ -1124,18 +1284,21 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
                             child_depth = parent_depth + 1
                             if u not in crawl_depth_map or crawl_depth_map[u] > child_depth:
                                 crawl_depth_map[u] = child_depth
+                                parent_url_map[u]  = crawled_url  # record who linked here
                             queue.append((u, child_depth))
                 except Exception as e:
                     logger.error(f"Crawl error {crawled_url}: {e}")
 
             logger.info(f"  Crawled: {len(visited)} | Queue: {len(queue)}")
 
-    # Assign depths
+    # Assign depths and parent URLs to all pages
     for p in pages_list:
-        p["crawl_depth"] = crawl_depth_map.get(
-            _normalize(p.get("url", "")),
-            crawl_depth_map.get(p.get("url", ""), -1)
-        )
+        url_n = _normalize(p.get("url", ""))
+        raw_url = p.get("url", "")
+        depth = crawl_depth_map.get(url_n, crawl_depth_map.get(raw_url, -1))
+        # Clamp -1 (unresolved) to 0 so depth_analysis always has non-negative values
+        p["crawl_depth"]  = max(0, depth) if depth >= 0 else 0
+        p["_parent_url"]  = parent_url_map.get(url_n, parent_url_map.get(raw_url, ""))
 
     logger.info(f"Crawl done: {len(pages_list)} pages, {len(images_list)} images")
 
@@ -1148,7 +1311,17 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     logger.info(f"Checking {len(unique_links)} unique links...")
     found_broken = []
 
+    # URLs to skip in broken link checks
+    BROKEN_LINK_SKIP_DOMAINS = (
+        "play.google.com", "apps.apple.com", "market.android.com",
+        "itunes.apple.com", "appstore.com",
+    )
+
     def _check_link(target, source):
+        # Ignore app store URLs — they often return non-200 outside a device context
+        target_host = urlparse(target).netloc.lower()
+        if any(skip in target_host for skip in BROKEN_LINK_SKIP_DOMAINS):
+            return
         try:
             r = _safe_head(target, timeout=BROKEN_LINK_TIMEOUT)
             if r.status_code in (404, 410, 500, 502, 503):
@@ -1240,6 +1413,20 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
         from ai_helpers import ai_alt_recommendations
         missing_imgs = [i for i in images_list if i.get("alt_status") == "Missing"]
         if missing_imgs:
+            # Enrich each image with its page title + primary keyword so the AI
+            # can generate context-aware, keyword-rich ALT text
+            page_meta_map = {
+                p.get("url", ""): {
+                    "page_title":     p.get("current_title", "") or "",
+                    "primary_keyword": p.get("primary_keyword", "") or "",
+                }
+                for p in pages_list if p.get("url")
+            }
+            for img in missing_imgs:
+                meta = page_meta_map.get(img.get("page", ""), {})
+                img["page_title"]     = meta.get("page_title", "")
+                img["primary_keyword"] = meta.get("primary_keyword", "")
+
             alt_recs = ai_alt_recommendations(missing_imgs)
             for img in images_list:
                 if img.get("src") in alt_recs:
@@ -1264,11 +1451,6 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     llm_prompts_data = []
     depth_analysis_data = []
     schema_analysis_data = []
-    # New: keyword planner, schema, LLM prompts, depth analysis
-    keyword_planner_data = []
-    schema_analysis_data = []
-    llm_prompts_data = []
-    depth_analysis_data = []
 
     if ai_mode != "4":
         from ai_helpers import (
@@ -1375,39 +1557,189 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     # depth_analysis and schema_analysis built below before scorecard
 
     # ── Depth Analysis — built from all crawled pages ──
+    # Count how many times each URL is linked to (approximates internal_links_count)
+    internal_link_counts: dict = {}
+    for source, target in pending_links:
+        norm_t = _normalize(target) if target else target
+        internal_link_counts[norm_t] = internal_link_counts.get(norm_t, 0) + 1
+
     depth_analysis_data = []
     for p in pages_list:
-        if not p.get("url"):
+        url = p.get("url", "")
+        if not url:
             continue
+        # crawl_depth is already clamped >= 0 from the assign step above
+        depth = p.get("crawl_depth", 0)
+        if depth is None or depth < 0:
+            depth = 0
+        # has_schema: handle both string "Present" and boolean True
+        schema_val = p.get("schema_markup", "")
+        has_schema = (schema_val == "Present" or schema_val is True or schema_val == 1)
+        # internal_links_count: how many internal links point TO this page
+        ilinks = internal_link_counts.get(_normalize(url), 0)
         depth_analysis_data.append({
-            "depth_level":          int(p.get("crawl_depth", 0) or 0),
-            "page_url":             p.get("url", ""),
+            "depth_level":          int(depth),
+            "page_url":             url,
             "page_title":           p.get("current_title", "") or "",
-            "parent_url":           "",
+            "parent_url":           p.get("_parent_url", "") or "",
             "seo_score":            int(p.get("seo_score", 0) or 0),
             "status_code":          str(p.get("status", "")),
             "word_count":           int(p.get("word_count", 0) or 0),
-            "has_schema":           p.get("schema_markup") == "Present",
-            "internal_links_count": 0,
+            "has_schema":           bool(has_schema),
+            "internal_links_count": ilinks,
         })
-    logger.info(f"depth_analysis: {len(depth_analysis_data)} records built")
+    logger.info(f"depth_analysis: {len(depth_analysis_data)} records built "
+                f"(depths: {sorted(set(d['depth_level'] for d in depth_analysis_data))[:15]})")
 
     # ── Schema Analysis — built from _schema_analysis collected during crawl ──
+    # For pages that have _schema_analysis (live crawl): merge AI snippet + store.
+    # For pages loaded from DB on resume (no _schema_analysis): reconstruct the full
+    # analysis from page data so recommended_schemas, missing_schemas, and
+    # recommended_snippets (JSON-LD templates) are never stored as empty.
     schema_analysis_data = []
     for p in pages_list:
         sa = p.get("_schema_analysis")
+        ai_snip = p.get("ai_schema_code_snippet", "") or ""
+
         if sa and sa.get("page_url"):
+            # ── Live crawl path: _schema_analysis already populated ──
+            # Merge AI snippet as the first recommended snippet
+            if ai_snip:
+                existing = sa.get("recommended_snippets", []) or []
+                if ai_snip not in existing:
+                    sa["recommended_snippets"] = [ai_snip] + existing
             schema_analysis_data.append(sa)
+
         elif str(p.get("status", "")).startswith("200") or p.get("status") == 200:
-            stypes = p.get("schema_types_found", "")
+            # ── Resume / DB-loaded path: rebuild full schema analysis from page data ──
+            url = p.get("url", "")
+            stypes_raw = p.get("schema_types_found", "") or ""
+            found_types = stypes_raw.split(", ") if stypes_raw and stypes_raw != "None" else []
+
+            # Reconstruct recommended + missing schemas using the same rule-based logic
+            # as _analyze_page_schema() so the fallback is never empty
+            from urllib.parse import urlparse as _up
+            path_lower = _up(url).path.lower() if url else ""
+            recommended = ["WebPage"]
+            if path_lower.count("/") <= 1:  # equivalent to url.lower().count("/") <= 3
+                recommended.extend(["Organization", "WebSite"])
+            if any(w in path_lower for w in ["/about", "/team", "/company"]):
+                recommended.extend(["Organization", "AboutPage"])
+            if any(w in path_lower for w in ["/contact", "/get-in-touch"]):
+                recommended.extend(["ContactPage", "LocalBusiness"])
+            if any(w in path_lower for w in ["/service", "/product", "/solution"]):
+                recommended.extend(["Service", "Product"])
+            if any(w in path_lower for w in ["/blog", "/article", "/news", "/post"]):
+                recommended.extend(["Article", "BlogPosting", "BreadcrumbList"])
+            if any(w in path_lower for w in ["/faq", "/frequently"]):
+                recommended.append("FAQPage")
+            if any(w in path_lower for w in ["/pricing", "/plans"]):
+                recommended.extend(["PriceSpecification", "Offer"])
+            if path_lower.count("/") > 1 and "BreadcrumbList" not in recommended:  # equivalent to url.lower().count("/") > 3
+                recommended.append("BreadcrumbList")
+            recommended = list(set(recommended))
+            missing = [s for s in recommended if s not in found_types]
+            schema_status = p.get("schema_markup", "Missing")
+            if not found_types:
+                schema_status = "Missing"
+            elif missing:
+                schema_status = "Partial"
+            else:
+                schema_status = "Complete"
+
+            # Build JSON-LD snippet templates for every missing schema type
+            parsed_domain = _up(url).netloc if url else ""
+            page_name = _up(url).path.strip("/").replace("-", " ").replace("/", " ").title() or "Home"
+            brand_name = parsed_domain.replace("www.", "").split(".")[0].title()
+            SCHEMA_TEMPLATES = {
+                "WebPage": {"@context": "https://schema.org", "@type": "WebPage",
+                             "url": url, "name": page_name, "description": ""},
+                "WebSite": {"@context": "https://schema.org", "@type": "WebSite",
+                             "url": f"https://{parsed_domain}/", "name": brand_name,
+                             "potentialAction": {"@type": "SearchAction",
+                                                 "target": f"https://{parsed_domain}/?s={{search_term_string}}",
+                                                 "query-input": "required name=search_term_string"}},
+                "Organization": {"@context": "https://schema.org", "@type": "Organization",
+                                  "name": brand_name, "url": f"https://{parsed_domain}/",
+                                  "logo": f"https://{parsed_domain}/logo.png",
+                                  "contactPoint": {"@type": "ContactPoint",
+                                                    "telephone": "+1-000-000-0000",
+                                                    "contactType": "customer service"}},
+                "LocalBusiness": {"@context": "https://schema.org", "@type": "LocalBusiness",
+                                   "name": brand_name, "url": f"https://{parsed_domain}/",
+                                   "telephone": "+1-000-000-0000",
+                                   "address": {"@type": "PostalAddress",
+                                               "streetAddress": "123 Main St",
+                                               "addressLocality": "City",
+                                               "addressRegion": "State",
+                                               "postalCode": "00000",
+                                               "addressCountry": "US"}},
+                "ContactPage": {"@context": "https://schema.org", "@type": "ContactPage",
+                                 "url": url, "name": page_name},
+                "AboutPage": {"@context": "https://schema.org", "@type": "AboutPage",
+                               "url": url, "name": page_name},
+                "Service": {"@context": "https://schema.org", "@type": "Service",
+                             "name": page_name, "url": url, "description": "",
+                             "provider": {"@type": "Organization", "name": brand_name}},
+                "Product": {"@context": "https://schema.org", "@type": "Product",
+                             "name": page_name, "url": url,
+                             "offers": {"@type": "Offer", "priceCurrency": "USD",
+                                         "price": "0.00",
+                                         "availability": "https://schema.org/InStock"}},
+                "Article": {"@context": "https://schema.org", "@type": "Article",
+                             "headline": page_name, "url": url,
+                             "author": {"@type": "Person", "name": "Author Name"},
+                             "publisher": {"@type": "Organization", "name": brand_name,
+                                            "logo": {"@type": "ImageObject",
+                                                      "url": f"https://{parsed_domain}/logo.png"}},
+                             "datePublished": "", "dateModified": ""},
+                "BlogPosting": {"@context": "https://schema.org", "@type": "BlogPosting",
+                                 "headline": page_name, "url": url,
+                                 "author": {"@type": "Person", "name": "Author Name"},
+                                 "datePublished": "", "dateModified": ""},
+                "FAQPage": {"@context": "https://schema.org", "@type": "FAQPage",
+                             "mainEntity": [
+                                 {"@type": "Question", "name": "Question 1?",
+                                  "acceptedAnswer": {"@type": "Answer", "text": "Answer 1."}},
+                                 {"@type": "Question", "name": "Question 2?",
+                                  "acceptedAnswer": {"@type": "Answer", "text": "Answer 2."}},
+                             ]},
+                "BreadcrumbList": {"@context": "https://schema.org", "@type": "BreadcrumbList",
+                                   "itemListElement": [
+                                       {"@type": "ListItem", "position": 1,
+                                        "name": "Home", "item": f"https://{parsed_domain}/"},
+                                       {"@type": "ListItem", "position": 2,
+                                        "name": page_name, "item": url},
+                                   ]},
+                "PriceSpecification": {"@context": "https://schema.org",
+                                        "@type": "PriceSpecification",
+                                        "priceCurrency": "USD", "price": "0.00"},
+                "Offer": {"@context": "https://schema.org", "@type": "Offer",
+                           "url": url, "priceCurrency": "USD", "price": "0.00",
+                           "availability": "https://schema.org/InStock"},
+            }
+            rec_snippets = []
+            # AI snippet goes first (most specific/accurate)
+            if ai_snip:
+                rec_snippets.append(ai_snip)
+            # Then template snippets for every missing schema type
+            for schema_type in missing:
+                tmpl = SCHEMA_TEMPLATES.get(schema_type)
+                snippet = json.dumps(tmpl, indent=2) if tmpl else json.dumps(
+                    {"@context": "https://schema.org", "@type": schema_type,
+                     "url": url, "name": page_name}, indent=2
+                )
+                if snippet not in rec_snippets:
+                    rec_snippets.append(snippet)
+
             schema_analysis_data.append({
-                "page_url":             p.get("url", ""),
-                "schema_types_found":   stypes.split(", ") if stypes and stypes != "None" else [],
-                "schema_snippets":      [],
-                "recommended_schemas":  [],
-                "recommended_snippets": [],
-                "schema_status":        p.get("schema_markup", "Missing"),
-                "missing_schemas":      [],
+                "page_url":             url,
+                "schema_types_found":   found_types,
+                "schema_snippets":      [],   # existing snippets not available without re-fetch
+                "recommended_schemas":  recommended,
+                "recommended_snippets": rec_snippets,
+                "schema_status":        schema_status,
+                "missing_schemas":      missing,
             })
     logger.info(f"schema_analysis: {len(schema_analysis_data)} records built")
 
@@ -1421,7 +1753,13 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     site_analysis_data = _build_site_analysis(pages_list, sitemap_urls_found)
 
     # ── Generated SEO files ────────────────────────────────────────────────────
-    generated_files = _generate_seo_files(base_url, domain, pages_list, broken_links_list)
+    generated_files = _generate_seo_files(
+        base_url, domain, pages_list, broken_links_list,
+        keyword_data=keyword_data,
+        blog_topics_data=blog_topics_data,
+        detected_location=detected_location,
+        sitemap_urls_found=sitemap_urls_found,
+    )
 
     # ── DB — save site-wide data ───────────────────────────────────────────────
     def _safe_db_insert(label, func, *args):
@@ -1556,6 +1894,7 @@ def _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespe
                 "ai_meta_title":            ai.get("meta_title", ""),
                 "ai_meta_description":      ai.get("meta_description", ""),
                 "ai_h1":                    ai.get("h1", ""),
+                "ai_h2":                    " | ".join(ai.get("h2_suggestions", [])) if isinstance(ai.get("h2_suggestions"), list) else ai.get("h2_suggestions", ""),
                 "ai_og_title":              ai.get("og_title", ""),
                 "ai_og_description":        ai.get("og_description", ""),
                 "ai_og_image_url":          ai.get("og_image_url", ""),
@@ -1585,6 +1924,14 @@ def _analyze_pages(pages_200, base_url, audit_id, detected_location, run_pagespe
                 saved = _save_screenshot_proper(ss_b64, ss_path)
                 if saved:
                     pd["_screenshot_path"] = saved
+
+            # ── Merge AI schema snippet into _schema_analysis for DB storage ──
+            ai_snippet = ai.get("schema_code_snippet", "")
+            if ai_snippet and pd.get("_schema_analysis"):
+                sa = pd["_schema_analysis"]
+                existing = sa.get("recommended_snippets", []) or []
+                if ai_snippet not in existing:
+                    sa["recommended_snippets"] = [ai_snippet] + existing
 
             # AEO FAQ + body copy guidance — first 50 pages only (cost control)
             if idx < 50:
@@ -1822,8 +2169,13 @@ def _build_site_analysis(pages_list, sitemap_urls):
     return data
 
 
-def _generate_seo_files(base_url, domain, pages_list, broken_links):
+def _generate_seo_files(base_url, domain, pages_list, broken_links,
+                         keyword_data=None, blog_topics_data=None,
+                         detected_location="Global", sitemap_urls_found=None):
     """Generate sitemap.xml, robots.txt, llms.txt, .htaccess, nginx redirects, broken link report."""
+    keyword_data       = keyword_data or {}
+    blog_topics_data   = blog_topics_data or []
+    sitemap_urls_found = sitemap_urls_found or []
     files = []
     urls_200 = [p["url"] for p in pages_list if _is_200(p) and p.get("url")]
 
@@ -1840,16 +2192,171 @@ def _generate_seo_files(base_url, domain, pages_list, broken_links):
     files.append({"file_name": "robots.txt", "file_type": "text/plain",
                   "file_content": robots, "file_size": len(robots.encode())})
 
-    # llms.txt
-    brand = domain.replace("www.", "").split(".")[0].title()
-    keywords = set()
-    for p in pages_list:
-        if p.get("primary_keyword"):
-            keywords.add(p["primary_keyword"])
-    llms = f"# {brand}\n\n## About\n{brand} is a business at {base_url}\n\n## Services\n"
-    for kw in list(keywords)[:20]:
-        llms += f"- {kw}\n"
-    llms += f"\n## Contact\nWebsite: {base_url}\n"
+    # llms.txt — structured like the All-in-One SEO / reference format
+    # Format: # Brand, tagline, ## Sitemaps, ## Posts, ## Pages, ## Products,
+    #         ## Services, ## Product categories
+    brand      = domain.replace("www.", "").split(".")[0].title()
+    brand_name = keyword_data.get("business_type", brand)
+
+    # Build tagline from services
+    service_names = [s.get("service","") for s in keyword_data.get("services",[]) if s.get("service")]
+    tagline = " & ".join(service_names[:3]) if service_names else f"Professional services at {domain}"
+
+    # ── Classify pages by type using URL patterns ──
+    posts    = []   # blog / article / news / post URLs
+    products = []   # product URLs
+    prod_cats = []  # product category URLs
+    pages_nav = []  # regular pages (home, about, contact, etc.)
+
+    POST_PATTERNS    = ["/blog/", "/article/", "/news/", "/post/", "/naturally-kind-notes/",
+                         "/insights/", "/resources/", "/tips/", "/guide/"]
+    PRODUCT_PATTERNS = ["/product/", "/products/", "/shop/product/"]
+    CAT_PATTERNS     = ["/product-category/", "/product-cat/", "/category/", "/shop/category/"]
+    SKIP_NAV         = {"/cart/", "/checkout/", "/my-account/", "/wp-login",
+                         "/wp-admin/", "/login", "/signin", "/register"}
+
+    # Build a quick lookup: url -> page dict for description access
+    page_by_url = {p.get("url",""): p for p in pages_list if p.get("url")}
+
+    for url in urls_200:
+        url_lower = url.lower()
+        if any(s in url_lower for s in SKIP_NAV):
+            continue
+        if any(pat in url_lower for pat in PRODUCT_PATTERNS):
+            products.append(url)
+        elif any(pat in url_lower for pat in CAT_PATTERNS):
+            prod_cats.append(url)
+        elif any(pat in url_lower for pat in POST_PATTERNS):
+            posts.append(url)
+        elif urlparse(url).path.count("/") == 2 and "-" in urlparse(url).path:
+            # Heuristic: single-level slugs with hyphens are likely blog posts
+            posts.append(url)
+        else:
+            pages_nav.append(url)
+
+    def _page_title(url):
+        p = page_by_url.get(url, {})
+        return p.get("current_title","") or p.get("current_h1","") or ""
+
+    def _page_desc(url, max_len=200):
+        """Return meta description or first snippet of content for a page."""
+        p = page_by_url.get(url, {})
+        desc = p.get("current_meta_description","") or ""
+        return desc[:max_len].strip()
+
+    def _page_label(url):
+        """Human-readable label: title if available, else cleaned URL slug."""
+        title = _page_title(url)
+        if title:
+            return title
+        slug = urlparse(url).path.strip("/").split("/")[-1]
+        return slug.replace("-"," ").replace("_"," ").title() if slug else domain
+
+    # ── Build llms.txt ──
+    llms  = f"Generated by AquilTechLabs SEO Audit, this is an llms.txt file, used by LLMs to index the site.\n\n"
+    llms += f"# {brand}\n\n"
+    llms += f"{tagline}\n\n"
+
+    # ## Sitemaps
+    llms += "## Sitemaps\n\n"
+    llms += f"- [XML Sitemap]({base_url.rstrip('/')}/sitemap.xml): Contains all public & indexable URLs for this website.\n"
+    if sitemap_urls_found:
+        llms += f"  Total URLs in sitemap: {len(sitemap_urls_found)}\n"
+    llms += "\n"
+
+    # ## Posts (blog articles)
+    if posts:
+        llms += "## Posts\n\n"
+        for url in posts[:30]:
+            label = _page_label(url)
+            desc  = _page_desc(url)
+            llms += f"- [{label}]({url})"
+            if desc:
+                llms += f" - {desc}"
+            llms += "\n"
+        llms += "\n"
+
+    # ## Pages (navigation / information pages)
+    if pages_nav:
+        llms += "## Pages\n\n"
+        for url in pages_nav[:30]:
+            label = _page_label(url)
+            desc  = _page_desc(url)
+            llms += f"- [{label}]({url})"
+            if desc:
+                llms += f" - {desc}"
+            llms += "\n"
+        llms += "\n"
+
+    # ## Products
+    if products:
+        llms += "## Products\n\n"
+        for url in products[:50]:
+            label = _page_label(url)
+            desc  = _page_desc(url)
+            llms += f"- [{label}]({url})"
+            if desc:
+                llms += f" - {desc}"
+            llms += "\n"
+        llms += "\n"
+
+    # ## Services (from keyword_data — all detected services with keywords)
+    if keyword_data.get("services"):
+        llms += "## Services\n\n"
+        for svc in keyword_data["services"]:
+            svc_name = svc.get("service","")
+            primary  = svc.get("primary","")
+            keywords = svc.get("keywords",[])
+            short_t  = svc.get("short_tail",[])
+            long_t   = svc.get("long_tail",[])
+            if not svc_name:
+                continue
+            llms += f"### {svc_name}\n"
+            if primary:
+                llms += f"Primary keyword: {primary}\n"
+            if keywords:
+                llms += f"Keywords: {", ".join(keywords[:5])}\n"
+            if short_t:
+                llms += f"Short-tail: {", ".join(short_t)}\n"
+            if long_t:
+                llms += f"Long-tail: {", ".join(long_t)}\n"
+            llms += "\n"
+
+    # ## Blog Topics (from AI blog_topics_data)
+    if blog_topics_data:
+        llms += "## Blog Topics\n\n"
+        for svc_entry in blog_topics_data:
+            svc_name = svc_entry.get("service","")
+            topics   = svc_entry.get("topics",[])
+            if not topics:
+                continue
+            if svc_name:
+                llms += f"### {svc_name}\n"
+            for topic in topics[:5]:
+                title = topic.get("title","")
+                kw    = topic.get("target_keyword","")
+                desc  = topic.get("description","")
+                if title:
+                    llms += f"- {title}"
+                    if kw:   llms += f" [{kw}]"
+                    if desc: llms += f" — {desc[:120]}"
+                    llms += "\n"
+            llms += "\n"
+
+    # ## Product Categories
+    if prod_cats:
+        llms += "## Product categories\n\n"
+        for url in prod_cats:
+            label = _page_label(url)
+            llms += f"- [{label}]({url})\n"
+        llms += "\n"
+
+    # ## Contact
+    llms += "## Contact\n\n"
+    llms += f"Website: {base_url}\n"
+    if detected_location and detected_location != "Global":
+        llms += f"Location: {detected_location}\n"
+
     files.append({"file_name": "llms.txt", "file_type": "text/plain",
                   "file_content": llms, "file_size": len(llms.encode())})
 

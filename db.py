@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS pages (
     ai_meta_title             TEXT,
     ai_meta_description       TEXT,
     ai_h1                     TEXT,
+    ai_h2                     TEXT,
     ai_og_title               TEXT,
     ai_og_description         TEXT,
     ai_og_image_url           TEXT,
@@ -416,6 +417,7 @@ CREATE TABLE IF NOT EXISTS schema_markup_analysis (
     recommended_snippets TEXT,
     schema_status       TEXT,
     missing_schemas     TEXT,
+    UNIQUE (audit_id, page_url),
     validation_errors   TEXT,
     created_at          TIMESTAMP DEFAULT NOW()
 );
@@ -449,7 +451,8 @@ CREATE TABLE IF NOT EXISTS depth_analysis (
     word_count            INTEGER DEFAULT 0,
     has_schema            BOOLEAN DEFAULT FALSE,
     internal_links_count  INTEGER DEFAULT 0,
-    created_at            TIMESTAMP DEFAULT NOW()
+    created_at            TIMESTAMP DEFAULT NOW(),
+    UNIQUE (audit_id, page_url)
 );
 
 -- New page suggestions
@@ -497,6 +500,7 @@ PAGES_REQUIRED_COLUMNS = [
     ("spam_malware_flags",   "TEXT"),
     ("serp_preview",         "TEXT"),
     ("image_optimization_tips", "TEXT"),
+    ("ai_h2",                 "TEXT"),
 ]
 
 AUDITS_REQUIRED_COLUMNS = [
@@ -594,6 +598,9 @@ def init_db():
         # Fix any tables that may have been created without SERIAL sequences
         _fix_serial_sequences(conn)
 
+        # Ensure UNIQUE constraints exist on tables that need them for upserts
+        _migrate_unique_constraints(conn)
+
         logger.info("PostgreSQL schema initialized ✓")
     except Exception as e:
         try: conn.rollback()
@@ -633,6 +640,40 @@ def _migrate_columns(conn, table: str, required_cols: list):
             logger.info(f"Migration: {table} schema is up to date")
     except Exception as e:
         logger.error(f"Migration error for {table}: {e}")
+
+
+def _migrate_unique_constraints(conn):
+    """Safely add UNIQUE constraints needed for ON CONFLICT upserts.
+    Safe to run on existing DBs — skips if constraint already exists.
+    """
+    constraints = [
+        # (table, constraint_name, columns)
+        ("depth_analysis",       "depth_analysis_audit_url_unique",      "audit_id, page_url"),
+        ("schema_markup_analysis","schema_markup_analysis_audit_url_uq", "audit_id, page_url"),
+    ]
+    for table, constraint_name, columns in constraints:
+        try:
+            with conn.cursor() as cur:
+                # Check if constraint already exists
+                cur.execute("""
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE table_name = %s AND constraint_name = %s
+                    AND table_schema = 'public'
+                """, (table, constraint_name))
+                if cur.fetchone():
+                    continue  # already exists — skip
+                # Add the constraint
+                cur.execute(f"""
+                    ALTER TABLE {table}
+                    ADD CONSTRAINT {constraint_name} UNIQUE ({columns})
+                """)
+            conn.commit()
+            logger.info(f"Migration: added UNIQUE({columns}) to {table}")
+        except Exception as e:
+            try: conn.rollback()
+            except Exception: pass
+            # Might fail if duplicate rows already exist — log and continue
+            logger.warning(f"Migration: could not add UNIQUE to {table}: {str(e)[:120]}")
 
 # ── DB Helper Functions ────────────────────────────────────────────────────────
 
@@ -750,7 +791,7 @@ def db_insert_page(conn, audit_id: int, p: dict):
         "schema_markup","schema_types_found","total_images","images_missing_alt",
         "image_alt_status","primary_keyword","secondary_keywords",
         "short_tail_keywords","long_tail_keywords",
-        "ai_meta_title","ai_meta_description","ai_h1",
+        "ai_meta_title","ai_meta_description","ai_h1","ai_h2",
         "ai_og_title","ai_og_description","ai_og_image_url",
         "ai_schema_recommendation","ai_schema_code_snippet",
         "ai_optimized_url","image_optimization_tips","serp_preview",
@@ -798,7 +839,7 @@ def db_update_page_ai(conn, audit_id: int, url: str, p: dict):
             UPDATE pages SET
                 primary_keyword=%s, secondary_keywords=%s,
                 short_tail_keywords=%s, long_tail_keywords=%s,
-                ai_meta_title=%s, ai_meta_description=%s, ai_h1=%s,
+                ai_meta_title=%s, ai_meta_description=%s, ai_h1=%s, ai_h2=%s,
                 ai_og_title=%s, ai_og_description=%s, ai_og_image_url=%s,
                 ai_schema_recommendation=%s, ai_schema_code_snippet=%s,
                 ai_optimized_url=%s, image_optimization_tips=%s, serp_preview=%s,
@@ -814,6 +855,7 @@ def db_update_page_ai(conn, audit_id: int, url: str, p: dict):
             _safe(p.get("ai_meta_title","")),
             _safe(p.get("ai_meta_description","")),
             _safe(p.get("ai_h1","")),
+            _safe(p.get("ai_h2","")),
             _safe(p.get("ai_og_title","")),
             _safe(p.get("ai_og_description","")),
             _safe(p.get("ai_og_image_url","")),
@@ -1232,6 +1274,14 @@ def db_insert_schema_analysis(conn, audit_id: int, schema_results: list):
                          recommended_schemas, recommended_snippets, schema_status,
                          missing_schemas, validation_errors)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (audit_id, page_url) DO UPDATE SET
+                        schema_types_found   = EXCLUDED.schema_types_found,
+                        schema_snippets      = EXCLUDED.schema_snippets,
+                        recommended_schemas  = EXCLUDED.recommended_schemas,
+                        recommended_snippets = EXCLUDED.recommended_snippets,
+                        schema_status        = EXCLUDED.schema_status,
+                        missing_schemas      = EXCLUDED.missing_schemas,
+                        validation_errors    = EXCLUDED.validation_errors
                 """, row)
             conn.commit()
             inserted += 1
@@ -1300,9 +1350,18 @@ def db_insert_depth_analysis(conn, audit_id: int, depth_records: list):
                 (audit_id, depth_level, page_url, page_title, parent_url,
                  seo_score, status_code, word_count, has_schema, internal_links_count)
             VALUES %s
+            ON CONFLICT (audit_id, page_url) DO UPDATE SET
+                depth_level          = EXCLUDED.depth_level,
+                page_title           = EXCLUDED.page_title,
+                parent_url           = EXCLUDED.parent_url,
+                seo_score            = EXCLUDED.seo_score,
+                status_code          = EXCLUDED.status_code,
+                word_count           = EXCLUDED.word_count,
+                has_schema           = EXCLUDED.has_schema,
+                internal_links_count = EXCLUDED.internal_links_count
         """, rows)
     conn.commit()
-    logger.info(f"depth_analysis: inserted {len(rows)} records for audit #{audit_id}")
+    logger.info(f"depth_analysis: upserted {len(rows)} records for audit #{audit_id}")
 
 
 def db_insert_blog_topics_full(conn, audit_id: int, blog_data: list):

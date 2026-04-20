@@ -144,13 +144,14 @@ STRICT RULES — FOLLOW EXACTLY:
 1. meta_title: MUST be 30-60 characters. MUST be DIFFERENT and BETTER than current. Include primary keyword near the start. If current is missing or too short, CREATE a compelling one based on the page content and URL.
 2. meta_description: MUST be 120-155 characters. MUST be DIFFERENT from current. Include primary keyword. Add call-to-action like "Learn more", "Discover", "Get started". If current is missing, CREATE one.
 3. h1: MUST be DIFFERENT from current H1 and from title. Include primary keyword. Make it user-friendly and descriptive. If missing, CREATE one based on page content.
-4. og_title: 40-60 characters. Engaging for social media sharing. Can differ from meta_title.
-5. og_description: 100-150 characters. Compelling social description with emoji-free CTA.
-6. NEVER repeat the current title/description/H1 verbatim — always IMPROVE them.
-7. If page content is thin or empty, infer the page purpose from the URL path and create appropriate metadata.
+4. h2_suggestions: Generate 3-5 SEO-optimized H2 subheadings that naturally structure the page content. Each H2 should target a secondary keyword or long-tail variation. Keep each H2 under 70 characters.
+5. og_title: 40-60 characters. Engaging for social media sharing. Can differ from meta_title.
+6. og_description: 100-150 characters. Compelling social description with emoji-free CTA.
+7. NEVER repeat the current title/description/H1 verbatim — always IMPROVE them.
+8. If page content is thin or empty, infer the page purpose from the URL path and create appropriate metadata.
 
 Return ONLY valid JSON (no markdown, no backticks):
-{{"primary_keyword":"main keyword for this page","secondary_keywords":["kw1","kw2","kw3"],"short_tail_keywords":["1-2 word keyword","another"],"long_tail_keywords":["4-8 word specific phrase","another phrase"],"meta_title":"NEW title 30-60 chars with keyword","meta_description":"NEW description 120-155 chars with keyword and CTA","h1":"NEW H1 different from title","og_title":"Social title 40-60 chars","og_description":"Social description 100-150 chars","og_image_url":"recommended OG image description","schema_type":"Schema.org type","schema_code_snippet":"JSON-LD example max 200 chars","optimized_url":"seo-friendly-slug","image_optimization_tips":"image SEO tips"}}
+{{"primary_keyword":"main keyword for this page","secondary_keywords":["kw1","kw2","kw3"],"short_tail_keywords":["1-2 word keyword","another"],"long_tail_keywords":["4-8 word specific phrase","another phrase"],"meta_title":"NEW title 30-60 chars with keyword","meta_description":"NEW description 120-155 chars with keyword and CTA","h1":"NEW H1 different from title","h2_suggestions":["H2 subheading 1","H2 subheading 2","H2 subheading 3"],"og_title":"Social title 40-60 chars","og_description":"Social description 100-150 chars","og_image_url":"recommended OG image description","schema_type":"Schema.org type","schema_code_snippet":"JSON-LD example max 200 chars","optimized_url":"seo-friendly-slug","image_optimization_tips":"image SEO tips"}}
 
 CURRENT PAGE DATA:
 URL: {url}
@@ -173,7 +174,9 @@ Return ONLY JSON array (no markdown): [{{"question":"...","answer":"..."}}]
 URL: {url} | Title: {title} | H1: {h1} | Keyword: {primary_keyword} | Location: {location}
 Content: {content[:1000]}
 """
-    try: return _parse_arr(ai_chat(prompt, max_tokens=800, temperature=0.3))
+    try:
+        result = _parse_arr(ai_chat(prompt, max_tokens=800, temperature=0.3))
+        return result[:5] if result else []  # Hard limit: max 5 FAQs
     except Exception as e: logger.error(f"ai_aeo_faq {url}: {e}"); return []
 
 
@@ -359,7 +362,7 @@ EXISTING CONTENT ON THE WEBSITE (DO NOT DUPLICATE):
 {existing_content_summary if existing_content_summary else "None"}
 
 RULES:
-1. Per service generate: 3 informational, 2 commercial, 1 local topic.
+1. Per service generate EXACTLY 5 topics total: 3 informational, 1 commercial, 1 local topic. HARD LIMIT: 5 topics per service, no more.
 2. CRITICAL: Check each topic against the existing content list above. If a similar topic (60%+ meaning overlap) already exists on the website, DO NOT suggest it. Only suggest NEW topics that fill content gaps.
 3. Analyze the website's keywords, services, and content to suggest topics that complement existing coverage.
 4. Keep titles concise and SEO-optimized. No year unless it adds value.
@@ -371,6 +374,10 @@ Return ONLY valid JSON array (no markdown):
         try:
             parsed = _parse_arr(ai_chat(prompt, max_tokens=2000, temperature=0.4, use_sonnet=True))
             if parsed and isinstance(parsed, list):
+                # Enforce hard limit of 5 topics per service
+                for svc_entry in parsed:
+                    if isinstance(svc_entry, dict) and "topics" in svc_entry:
+                        svc_entry["topics"] = svc_entry["topics"][:5]
                 all_topics.extend(parsed)
                 logger.info(f"Blog topics batch {i//3+1}: {sum(len(s.get('topics',[])) for s in parsed)} topics")
         except Exception as e: logger.error(f"ai_blog_topics batch {i}: {e}")
@@ -405,7 +412,12 @@ Per topic: title (50-70 chars), primary_keyword, secondary_keywords (3-5), short
 Return ONLY JSON: [{{"service":"{svc_name}","topics":[{{"title":"Title","type":"informational|commercial|comparison|howto|listicle","target_keyword":"kw","description":"summary","primary_keyword":"kw","secondary_keywords":["kw1"],"short_tail_keywords":["st1"],"long_tail_keywords":["lt1"],"content_outline":["Section 1"]}}]}}]"""
         try:
             parsed = _parse_arr(ai_chat(prompt, max_tokens=2000, temperature=0.4, use_sonnet=True))
-            if parsed: all_ideas.extend(parsed)
+            if parsed:
+                # Enforce hard limit of 5 topics per service
+                for svc_entry in parsed:
+                    if isinstance(svc_entry, dict) and "topics" in svc_entry:
+                        svc_entry["topics"] = svc_entry["topics"][:5]
+                all_ideas.extend(parsed)
         except Exception as e: logger.error(f"generate_blog_ideas_with_keywords {svc_name}: {e}")
     logger.info(f"generate_blog_ideas_with_keywords: {sum(len(s.get('topics',[])) for s in all_ideas)} topics")
     return all_ideas
@@ -501,9 +513,20 @@ Return ONLY valid JSON (no markdown, no backticks):
 
 def ai_six_month_plan(kw_json, bl_data, brand, domain, summary) -> dict:
     if not _has_client(): return {}
+    from calendar import month_name as _month_name
     current_year  = datetime.now().year
     current_month = datetime.now().month
     svcs = ", ".join(s["service"] for s in kw_json.get("services", []))
+
+    # Pre-compute real calendar month names for all 6 months
+    month_labels = []
+    for i in range(1, 7):
+        raw_m = current_month + i - 1
+        y = current_year + (raw_m - 1) // 12
+        m = ((raw_m - 1) % 12) + 1
+        month_labels.append(f"Month {i} — {_month_name[m]} {y}")
+    month_labels_str = "\n".join(f"  {lbl}" for lbl in month_labels)
+
     prompt = f"""You are a senior SEO project manager. Create a detailed 6-month SEO execution plan.
 
 Business: {brand}
@@ -511,37 +534,51 @@ Domain: {domain}
 Business Type: {kw_json.get('business_type', 'Unknown')}
 Services: {svcs}
 Current Audit Summary: {json.dumps(summary, default=str)}
-Start Date: Month {current_month}/{current_year}
 
-Create a month-by-month plan for 6 months. For EACH month include:
-- Key focus areas and tasks
-- Content deliverables (blog posts, pages to create/optimize)
-- Technical SEO tasks
-- Backlink building activities
-- Expected measurable outputs/results for that month
+The 6 months are (USE THESE EXACT BASE LABELS):
+{month_labels_str}
 
-Be realistic with expectations - SEO takes time. Show progressive improvement.
+CRITICAL RULES FOR month_label:
+- Format MUST be: "Month N — MonthName YYYY: Short Focus Theme"
+- The Short Focus Theme after the colon must be 4-7 words describing that month focus.
+- NEVER use placeholder text like "MMM YYYY" or "Month 1 (MMM YYYY)".
+- ALWAYS use the real month name from the list above.
+- Examples:
+    "Month 1 — {month_labels[0].split(" — ")[1]}: Technical Foundation & Quick Wins"
+    "Month 2 — {month_labels[1].split(" — ")[1]}: Content Creation & On-Page SEO"
+    "Month 3 — {month_labels[2].split(" — ")[1]}: Link Building & Authority Growth"
+    "Month 4 — {month_labels[3].split(" — ")[1]}: Keyword Expansion & Local SEO"
+    "Month 5 — {month_labels[4].split(" — ")[1]}: Conversion Optimization & Schema"
+    "Month 6 — {month_labels[5].split(" — ")[1]}: Scaling & Performance Review"
+
+For EACH month include:
+- focus: one clear sentence describing the primary SEO goal this month
+- tasks: 5-8 specific actionable tasks with categories (Technical|Content|Backlinks|Analytics)
+- deliverables: 3-5 concrete outputs the client receives
+- expected_output: realistic measurable results
+
+Progression guide: Month 1-2 = Foundation, Month 3-4 = Growth, Month 5-6 = Scaling.
 
 Return ONLY valid JSON (no markdown, no backticks):
 {{
-  "plan_start": "{current_month}/{current_year}",
+  "plan_start": "{month_labels[0]}",
   "months": [
     {{
       "month_number": 1,
-      "month_label": "Month 1 (MMM YYYY)",
-      "focus": "Primary focus area",
+      "month_label": "Month 1 — {month_labels[0].split(" — ")[1]}: Technical Foundation & Quick Wins",
+      "focus": "One sentence describing this month primary SEO goal",
       "tasks": [
-        {{"task": "Task description", "category": "Technical|Content|Backlinks|Analytics"}}
+        {{"task": "Specific actionable task", "category": "Technical|Content|Backlinks|Analytics"}}
       ],
-      "deliverables": ["Deliverable 1", "Deliverable 2"],
+      "deliverables": ["Deliverable 1", "Deliverable 2", "Deliverable 3"],
       "expected_output": {{
-        "organic_traffic_change": "+X%",
-        "keywords_improved": "X keywords move up",
-        "backlinks_target": "X new backlinks",
-        "pages_optimized": "X pages",
-        "content_published": "X blog posts",
-        "technical_fixes": "X issues resolved",
-        "summary": "Brief summary of expected outcome"
+        "organic_traffic_change": "+X% or baseline established",
+        "keywords_improved": "X keywords indexed/tracked",
+        "backlinks_target": "X new quality backlinks",
+        "pages_optimized": "X pages fixed/optimized",
+        "content_published": "X blog posts/pages published",
+        "technical_fixes": "X technical issues resolved",
+        "summary": "One sentence summary of expected outcome"
       }}
     }}
   ]
@@ -550,7 +587,16 @@ Return ONLY valid JSON (no markdown, no backticks):
         raw = ai_chat(prompt, max_tokens=4000, temperature=0.4, use_sonnet=True)
         if not raw: logger.warning("ai_six_month_plan: empty response"); return {}
         result = _parse_obj(raw)
-        logger.info(f"6-month plan: {len(result.get('months',[]))} months generated")
+        # Post-process: guarantee every month_label has real month name (AI fallback safety)
+        for i, month in enumerate(result.get("months", [])):
+            lbl  = month.get("month_label", "")
+            base = month_labels[i] if i < len(month_labels) else f"Month {i+1}"
+            real_month_name = base.split(" — ")[1].split(" ")[0]  # e.g. "April"
+            if not lbl or "MMM" in lbl or "YYYY" in lbl or real_month_name not in lbl:
+                focus = month.get("focus", "")[:50]
+                month["month_label"] = f"{base}: {focus}" if focus else base
+        labels_preview = [m.get("month_label", "")[:45] for m in result.get("months", [])]
+        logger.info(f"6-month plan: {len(result.get('months',[]))} months | {labels_preview}")
         return result
     except Exception as e: logger.error(f"ai_six_month_plan: {e}"); return {}
 
@@ -709,27 +755,72 @@ Return ONLY valid JSON (no markdown fences):
 def ai_alt_recommendations(images_missing: list) -> dict:
     if not _has_client() or not images_missing: return {}
     batch = images_missing[:50]
-    image_list = "\n".join(f"{i+1}. Page: {img['page']}\n   Image URL: {img['src']}" for i,img in enumerate(batch))
-    prompt = f"""You are an SEO image optimization expert. Based on the image URLs and their page context, suggest descriptive, keyword-rich ALT text for each image.
 
-Rules for good ALT text:
-- Descriptive: explain what the image shows
-- Keyword-rich but natural: include relevant keywords without stuffing
-- Concise: 8-15 words maximum
-- Contextual: relate to the page content
-- Accessible: useful for screen readers
+    def _img_filename(src: str) -> str:
+        """Extract a readable filename from image URL for context."""
+        try:
+            from urllib.parse import urlparse as _up
+            name = _up(src).path.split("/")[-1]
+            name = name.rsplit(".", 1)[0].replace("-", " ").replace("_", " ")
+            return name[:80] if name else ""
+        except Exception:
+            return ""
+
+    # Build rich image list with page title, primary keyword, and filename
+    image_list_lines = []
+    for i, img in enumerate(batch):
+        page_url   = img.get("page", "")
+        src        = img.get("src", "")
+        page_title = img.get("page_title", "")
+        primary_kw = img.get("primary_keyword", "")
+        filename   = _img_filename(src)
+        line = f"{i+1}. Page URL: {page_url}"
+        if page_title:  line += f"\n   Page Title: {page_title}"
+        if primary_kw:  line += f"\n   Page Keyword: {primary_kw}"
+        line += f"\n   Image URL: {src}"
+        if filename:    line += f"\n   Image Filename: {filename}"
+        image_list_lines.append(line)
+    image_list = "\n".join(image_list_lines)
+
+    prompt = f"""You are an SEO image optimization expert. Generate highly specific, descriptive ALT text for each image below.
+
+RULES FOR GOOD ALT TEXT:
+1. Descriptive and specific: describe exactly what the image shows — people, objects, actions, settings.
+2. Keyword-rich but natural: weave in the page keyword where it fits naturally. Do NOT keyword-stuff.
+3. Length: 8-15 words. Never a single word. Never more than 20 words.
+4. Context-aware: use the Page Title and Page Keyword to infer what the image likely depicts.
+5. Use the Image Filename as a clue — filenames like "team-meeting.jpg" or "seo-audit-dashboard.png"
+   tell you what the image shows. Expand them into a full descriptive phrase.
+6. Accessible: write as if describing to a visually impaired person.
+7. No "image of" or "photo of" — start directly with the description.
+8. Each ALT text must be UNIQUE — never repeat the same phrase.
+
+EXAMPLES OF GOOD ALT TEXT:
+- Filename: team-working.jpg, Page: Digital Marketing Agency → "Digital marketing team collaborating on SEO strategy in modern office"
+- Filename: logo.png, Page: About Us → "AcmeCorp official company logo in blue and white"
+- Filename: dashboard-screenshot.png, Page: SEO Tools → "SEO audit dashboard showing keyword rankings and traffic metrics"
+- Filename: hero-banner.jpg, Page: Web Design Services → "Professional web designer creating responsive website layout on laptop"
 
 Images needing ALT text:
 {image_list}
 
-Return ONLY valid JSON (no markdown fences). Return a JSON object where keys are the image numbers (as strings) and values are the recommended ALT text.
-Example: {{"1": "Professional web development team collaborating on software project", "2": "Modern office interior with standing desks and natural lighting"}}
+Return ONLY valid JSON (no markdown fences, no extra text).
+Keys are image numbers as strings, values are the ALT text.
+Example: {{"1": "Professional web development team reviewing SEO audit results on monitor", "2": "Company logo featuring blue geometric design on white background"}}
 """
     try:
         result = {}
-        for k,v in _parse_obj(ai_chat(prompt, max_tokens=800, temperature=0.4)).items():
-            idx = int(k) - 1
-            if 0 <= idx < len(batch): result[batch[idx]["src"]] = v
+        parsed = _parse_obj(ai_chat(prompt, max_tokens=1500, temperature=0.4))
+        for k, v in parsed.items():
+            try:
+                idx = int(k) - 1
+                if 0 <= idx < len(batch) and v and isinstance(v, str):
+                    alt_text = v.strip().strip("'\"")
+                    if 3 <= len(alt_text.split()) <= 25:
+                        result[batch[idx]["src"]] = alt_text
+            except (ValueError, TypeError):
+                continue
+        logger.info(f"ai_alt_recommendations: {len(result)} ALT texts generated")
         return result
     except Exception as e: logger.error(f"ai_alt_recommendations: {e}"); return {}
 
