@@ -2315,11 +2315,11 @@ def _generate_seo_files(base_url, domain, pages_list, broken_links,
             if primary:
                 llms += f"Primary keyword: {primary}\n"
             if keywords:
-                llms += f"Keywords: {", ".join(keywords[:5])}\n"
+                llms += "Keywords: " + ", ".join(keywords[:5]) + "\n"
             if short_t:
-                llms += f"Short-tail: {", ".join(short_t)}\n"
+                llms += "Short-tail: " + ", ".join(short_t) + "\n"
             if long_t:
-                llms += f"Long-tail: {", ".join(long_t)}\n"
+                llms += "Long-tail: " + ", ".join(long_t) + "\n"
             llms += "\n"
 
     # ## Blog Topics (from AI blog_topics_data)
