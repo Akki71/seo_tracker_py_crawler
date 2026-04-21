@@ -295,6 +295,79 @@ def get_audit(audit_id: int):
     finally:
         release_db_conn(conn)
 
+@app.get("/audit/{audit_id}/files")
+def list_generated_files(audit_id: int):
+    """List all generated SEO files available for an audit."""
+    from db import get_db_conn, release_db_conn
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT file_name, file_type, file_size, created_at
+                FROM generated_files WHERE audit_id = %s ORDER BY file_name
+            """, (audit_id,))
+            rows = cur.fetchall()
+        files = [
+            {
+                "file_name":    r[0],
+                "file_type":    r[1],
+                "file_size":    r[2],
+                "created_at":   r[3].isoformat() if r[3] else None,
+                "download_url": f"/audit/{audit_id}/file/{r[0]}"
+            }
+            for r in rows
+        ]
+        return {"audit_id": audit_id, "total": len(files), "files": files}
+    except Exception as e:
+        logger.error(f"list_generated_files error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        release_db_conn(conn)
+
+
+@app.get("/audit/{audit_id}/file/{file_name:path}")
+def get_generated_file(audit_id: int, file_name: str):
+    """
+    Download a generated SEO file by name.
+    file_name: llms.txt | sitemap.xml | robots.txt | .htaccess |
+               .htaccess_redirects | nginx_redirects.conf | broken_links_report.txt
+    """
+    from db import get_db_conn, release_db_conn
+    from fastapi.responses import PlainTextResponse
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT file_content, file_type FROM generated_files
+                WHERE audit_id = %s AND file_name = %s
+                ORDER BY id DESC LIMIT 1
+            """, (audit_id, file_name))
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"File '{file_name}' not found for audit #{audit_id}. "
+                       "Use GET /audit/{audit_id}/files to list available files."
+            )
+        file_content, file_type = row
+        if file_name.endswith(".xml"):
+            media_type = "application/xml"
+        else:
+            media_type = "text/plain; charset=utf-8"
+        return PlainTextResponse(
+            content=file_content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'inline; filename="{file_name}"'}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_generated_file error ({file_name}): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        release_db_conn(conn)
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _get_job_or_404(job_id: str) -> dict:
