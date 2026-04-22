@@ -209,16 +209,49 @@ def _check_file(domain, path, sitemap_urls_out=None):
                     if "<urlset" not in content and "<sitemapindex" not in content:
                         return "Invalid (no <urlset>)"
                     import xml.etree.ElementTree as ET
+                    NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
                     try:
                         root = ET.fromstring(content)
-                        locs = root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')
-                        if not locs:
-                            locs = root.findall('.//loc')
-                        if sitemap_urls_out is not None:
-                            for loc in locs:
-                                if loc.text:
-                                    sitemap_urls_out.append(loc.text.strip())
-                        return f"Valid ({len(locs)} URLs)"
+                        tag  = root.tag.lower()
+
+                        if "sitemapindex" in tag:
+                            # ── Sitemap Index: recursively fetch all child sitemaps ──
+                            # The <loc> tags here are child sitemap FILE URLs, not page URLs.
+                            # We must fetch each child sitemap to get the actual page URLs.
+                            child_locs = root.findall(f".//{{{NS}}}loc") or root.findall(".//loc")
+                            child_urls = [l.text.strip() for l in child_locs if l.text]
+                            logger.info(f"Sitemap index detected: {len(child_urls)} child sitemaps — "
+                                        f"fetching page URLs from each...")
+                            total_page_urls = 0
+                            for child_url in child_urls:
+                                try:
+                                    cr = _safe_get(child_url, timeout=15)
+                                    if not cr or cr.status_code != 200:
+                                        continue
+                                    child_root = ET.fromstring(cr.text.strip())
+                                    page_locs  = child_root.findall(f".//{{{NS}}}loc") or \
+                                                 child_root.findall(".//loc")
+                                    total_page_urls += len(page_locs)
+                                    if sitemap_urls_out is not None:
+                                        for loc in page_locs:
+                                            if loc.text:
+                                                sitemap_urls_out.append(loc.text.strip())
+                                    logger.info(f"  Child sitemap {child_url}: "
+                                                f"{len(page_locs)} page URLs")
+                                except Exception as ce:
+                                    logger.warning(f"  Child sitemap fetch failed {child_url}: {ce}")
+                            return (f"Valid Sitemap Index ({len(child_urls)} sitemaps, "
+                                    f"{total_page_urls} total URLs)")
+
+                        else:
+                            # ── Regular urlset: collect page URLs directly ──
+                            locs = root.findall(f".//{{{NS}}}loc") or root.findall(".//loc")
+                            if sitemap_urls_out is not None:
+                                for loc in locs:
+                                    if loc.text:
+                                        sitemap_urls_out.append(loc.text.strip())
+                            return f"Valid ({len(locs)} URLs)"
+
                     except ET.ParseError:
                         return "Invalid (XML parse error)"
                 elif path == "robots.txt":
