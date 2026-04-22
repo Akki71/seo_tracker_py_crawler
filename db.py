@@ -1427,6 +1427,7 @@ def db_get_crawled_urls(conn, audit_id: int) -> set:
 
 
 def db_find_existing_audit(conn, domain: str):
+    """Find an in-progress audit for this domain (crash-resume)."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, domain, base_url, target_location, business_type, ai_mode, audit_timestamp
@@ -1438,6 +1439,98 @@ def db_find_existing_audit(conn, domain: str):
             return None
         cols = [d[0] for d in cur.description]
         return dict(zip(cols, row))
+
+
+def db_find_last_completed_audit(conn, domain: str, brand_id: int = None):
+    """Find the most recent COMPLETED audit for this domain.
+    Used to continue crawling above the previous URL count.
+    Searches: (1) audit_status=complete, (2) any audit with crawled pages as fallback.
+    """
+    with conn.cursor() as cur:
+        # Primary: find completed audit
+        if brand_id:
+            cur.execute("""
+                SELECT id, domain, base_url, total_pages_crawled,
+                       target_location, business_type, ai_mode, audit_timestamp
+                FROM audits
+                WHERE domain=%s AND brand_id=%s AND audit_status='complete'
+                ORDER BY id DESC LIMIT 1
+            """, (domain, brand_id))
+        else:
+            cur.execute("""
+                SELECT id, domain, base_url, total_pages_crawled,
+                       target_location, business_type, ai_mode, audit_timestamp
+                FROM audits
+                WHERE domain=%s AND audit_status='complete'
+                ORDER BY id DESC LIMIT 1
+            """, (domain,))
+        row = cur.fetchone()
+        if row:
+            cols = [d[0] for d in cur.description]
+            return dict(zip(cols, row))
+
+        # Fallback: find any audit (any status) that has actual crawled pages
+        # This handles cases where audit_status was not updated correctly
+        if brand_id:
+            cur.execute("""
+                SELECT a.id, a.domain, a.base_url, a.total_pages_crawled,
+                       a.target_location, a.business_type, a.ai_mode, a.audit_timestamp
+                FROM audits a
+                WHERE a.domain=%s AND a.brand_id=%s
+                  AND a.audit_status != 'in_progress'
+                  AND EXISTS (
+                      SELECT 1 FROM pages p WHERE p.audit_id=a.id LIMIT 1
+                  )
+                ORDER BY a.id DESC LIMIT 1
+            """, (domain, brand_id))
+        else:
+            cur.execute("""
+                SELECT a.id, a.domain, a.base_url, a.total_pages_crawled,
+                       a.target_location, a.business_type, a.ai_mode, a.audit_timestamp
+                FROM audits a
+                WHERE a.domain=%s
+                  AND a.audit_status != 'in_progress'
+                  AND EXISTS (
+                      SELECT 1 FROM pages p WHERE p.audit_id=a.id LIMIT 1
+                  )
+                ORDER BY a.id DESC LIMIT 1
+            """, (domain,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        result = dict(zip(cols, row))
+        logger.info(f"db_find_last_completed_audit: using fallback for {domain} — "
+                    f"found audit #{result['id']} with status!=in_progress and pages")
+        return result
+
+
+def db_get_all_crawled_urls_for_domain(conn, domain: str, brand_id: int = None) -> set:
+    """Get ALL URLs ever crawled for this domain across all prior audits.
+    Includes completed + any other non-in_progress audits that have pages.
+    Used to seed the 'already visited' set so re-runs only crawl NEW pages.
+    """
+    with conn.cursor() as cur:
+        if brand_id:
+            cur.execute("""
+                SELECT DISTINCT p.url
+                FROM pages p
+                JOIN audits a ON p.audit_id = a.id
+                WHERE a.domain = %s AND a.brand_id = %s
+                  AND a.audit_status != 'in_progress'
+            """, (domain, brand_id))
+        else:
+            cur.execute("""
+                SELECT DISTINCT p.url
+                FROM pages p
+                JOIN audits a ON p.audit_id = a.id
+                WHERE a.domain = %s
+                  AND a.audit_status != 'in_progress'
+            """, (domain,))
+        urls = {row[0] for row in cur.fetchall()}
+        logger.info(f"db_get_all_crawled_urls_for_domain: {len(urls)} unique URLs "
+                    f"found for {domain} (brand_id={brand_id})")
+        return urls
 
 
 def db_query_pages(conn, audit_id: int) -> list:

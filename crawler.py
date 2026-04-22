@@ -1130,34 +1130,90 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
             if bs and bhtml:
                 logger.info("Browser successfully loaded the site.")
 
-    # ── Step 3: Create or RESUME DB audit record ─────────────────────────────
-    # If a previous run for this domain crashed mid-crawl (audit_status='in_progress'),
-    # we reload already-crawled pages and skip those URLs — no data lost.
-    from db import db_find_existing_audit, db_get_crawled_urls, db_query_pages
-    already_crawled: set = set()
-    pages_list_preloaded: list = []
+    # ── Step 3: Create / RESUME / CONTINUE audit record ──────────────────────
+    #
+    # Three cases handled:
+    #  A) in_progress audit exists  → RESUME (crash recovery, skip already-done URLs)
+    #  B) completed audit exists    → CONTINUE (new audit, but skip all previously
+    #                                 crawled URLs so we only crawl NEW pages above
+    #                                 the previous count — e.g. crawl URLs 2001-4000)
+    #  C) no prior audit            → FRESH START
+    from db import (db_find_existing_audit, db_get_crawled_urls, db_query_pages,
+                    db_find_last_completed_audit, db_get_all_crawled_urls_for_domain)
+    already_crawled: set = set()        # URLs to SKIP during this crawl
+    pages_list_preloaded: list = []     # Pages pre-loaded into memory (resume only)
+    continuation_mode: bool = False     # True when continuing past a completed audit
+    prev_crawled_count: int = 0         # How many URLs were done before this run
 
     conn = get_db_conn()
     try:
+        # ── Case A: Resume a crashed / in-progress audit ──
         existing = db_find_existing_audit(conn, domain)
         if existing:
             prev_id = existing["id"] if isinstance(existing, dict) else existing[0]
-            logger.info(f"Found in-progress audit #{prev_id} for {domain} — resuming...")
-            audit_id = prev_id
-            already_crawled = db_get_crawled_urls(conn, audit_id)
+            already_crawled = db_get_crawled_urls(conn, audit_id=prev_id)
+
             if already_crawled:
+                # ── Real resume: has crawled pages, continue from where it crashed ──
+                logger.info(f"Found in-progress audit #{prev_id} for {domain} "
+                            f"with {len(already_crawled)} crawled URLs — resuming...")
+                audit_id = prev_id
                 prev_pages = db_query_pages(conn, audit_id)
                 pages_list_preloaded = [dict(p) for p in prev_pages] if prev_pages else []
-                logger.info(f"Resume: {len(already_crawled)} URLs already crawled, "
+                logger.info(f"RESUME: {len(already_crawled)} URLs already crawled, "
                             f"{len(pages_list_preloaded)} pages loaded from DB")
-        else:
-            audit_id = db_create_audit(conn, brand_id, {
-                "domain": domain, "base_url": base_url,
-                "target_location": target_location or "Global",
-                "business_type": business_type or "",
-                "ai_mode": ai_mode,
-            })
-            logger.info(f"Created new audit #{audit_id}")
+            else:
+                # ── Stale/empty in_progress audit (0 pages) — delete it and fall through ──
+                logger.info(f"Found stale in-progress audit #{prev_id} for {domain} "
+                            f"with 0 pages crawled — deleting stale record and checking "
+                            f"for completed audits to continue from.")
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM audits WHERE id=%s", (prev_id,))
+                    conn.commit()
+                    logger.info(f"Stale audit #{prev_id} deleted.")
+                except Exception as del_err:
+                    try: conn.rollback()
+                    except Exception: pass
+                    logger.warning(f"Could not delete stale audit #{prev_id}: {del_err}")
+                # Release and get a fresh connection so Case B sees clean state
+                release_db_conn(conn)
+                conn = get_db_conn()
+                existing = None   # fall through to Case B / C below
+
+        if not existing:
+            # ── Case B: Completed audit exists — CONTINUE from where it left off ──
+            completed = db_find_last_completed_audit(conn, domain, brand_id)
+            if completed:
+                prev_count = completed.get("total_pages_crawled", 0) or 0
+                logger.info(f"Found completed audit #{completed['id']} for {domain} "
+                            f"({prev_count} pages crawled). "
+                            f"CONTINUE mode — will crawl NEW URLs only.")
+                # Load all URLs ever crawled for this domain so BFS skips them
+                already_crawled = db_get_all_crawled_urls_for_domain(conn, domain, brand_id)
+                prev_crawled_count = len(already_crawled)
+                continuation_mode = True
+                logger.info(f"CONTINUE: {prev_crawled_count} previously crawled URLs "
+                            f"will be skipped. Crawling up to {crawl_limit} NEW pages.")
+                # Create a FRESH audit record for this continuation run
+                audit_id = db_create_audit(conn, brand_id, {
+                    "domain": domain, "base_url": base_url,
+                    "target_location": target_location or "Global",
+                    "business_type": business_type or "",
+                    "ai_mode": ai_mode,
+                })
+                logger.info(f"Created continuation audit #{audit_id} "
+                            f"(continues from audit #{completed['id']})")
+
+            else:
+                # ── Case C: No prior audit — fresh start ──
+                audit_id = db_create_audit(conn, brand_id, {
+                    "domain": domain, "base_url": base_url,
+                    "target_location": target_location or "Global",
+                    "business_type": business_type or "",
+                    "ai_mode": ai_mode,
+                })
+                logger.info(f"Created new audit #{audit_id} (fresh start)")
     finally:
         release_db_conn(conn)
 
@@ -1188,14 +1244,19 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     images_lock      = Lock()
     broken_lock      = Lock()
 
-    # ── Resume: preload previously crawled pages + skip their URLs ────────────
+    # ── Seed visited set from already_crawled (works for both resume + continue) ──
+    # Resume mode:       pages_list_preloaded has data, already_crawled = that audit's URLs
+    # Continuation mode: pages_list_preloaded is empty, already_crawled = ALL prior URLs
+    # Fresh start:       both empty
     if pages_list_preloaded:
-        from collections import OrderedDict
         for pp in pages_list_preloaded:
             pages_list.append(pp)
-        logger.info(f"Preloaded {len(pages_list_preloaded)} pages from previous run")
+        logger.info(f"Preloaded {len(pages_list_preloaded)} pages from previous run (resume)")
     for u in already_crawled:
         visited.add(_normalize(u))
+    if continuation_mode:
+        logger.info(f"Continuation mode: {len(visited)} URLs pre-marked as visited "
+                    f"— BFS will only queue URLs not seen in any previous audit.")
 
     # ── BFS Crawl ─────────────────────────────────────────────────────────────
     # ── Large-site smart seeding ───────────────────────────────────────────────
@@ -1856,7 +1917,12 @@ def run_audit(input_url: str, brand_id: int, target_location: str = "",
     finally:
         release_db_conn(conn)
 
-    logger.info(f"Audit #{audit_id} complete — Excel: {excel_file} PDF: {pdf_file}")
+    if continuation_mode:
+        logger.info(f"Audit #{audit_id} complete (CONTINUATION — skipped {prev_crawled_count} "
+                    f"previously crawled URLs, added {len(pages_list)} new pages) "
+                    f"— Excel: {excel_file} PDF: {pdf_file}")
+    else:
+        logger.info(f"Audit #{audit_id} complete — Excel: {excel_file} PDF: {pdf_file}")
     return {"audit_id": audit_id, "excel_file": excel_file, "pdf_file": pdf_file}
 
 
