@@ -29,3 +29,6 @@ google-ads==23.0.0
 # Utilities
 python-multipart==0.0.12
 tenacity==8.2.3
+
+# Social Scraper
+playwright==1.44.0

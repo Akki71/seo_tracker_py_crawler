@@ -475,6 +475,79 @@ CREATE INDEX IF NOT EXISTS idx_schema_analysis_audit  ON schema_markup_analysis(
 CREATE INDEX IF NOT EXISTS idx_llm_prompts_audit       ON llm_prompts(audit_id);
 CREATE INDEX IF NOT EXISTS idx_depth_analysis_audit    ON depth_analysis(audit_id);
 CREATE INDEX IF NOT EXISTS idx_new_page_sugg_audit     ON new_page_suggestions(audit_id);
+
+-- ═══ Brand Intelligence tables (multi-platform scraper) ═══
+
+CREATE TABLE IF NOT EXISTS threads (
+    id              SERIAL PRIMARY KEY,
+    brand_id        INTEGER NOT NULL,
+    platform        VARCHAR(20)  NOT NULL DEFAULT 'reddit',
+    url             TEXT         NOT NULL,
+    title           TEXT,
+    subreddit       VARCHAR(128) DEFAULT '',
+    author          VARCHAR(255) DEFAULT '',
+    comment_count   INTEGER      DEFAULT 0,
+    claps           INTEGER      DEFAULT 0,
+    content         TEXT,
+    sentiment       VARCHAR(20)  DEFAULT 'neutral',
+    intent          VARCHAR(30)  DEFAULT 'general',
+    has_brand       BOOLEAN      DEFAULT FALSE,
+    has_competitor  BOOLEAN      DEFAULT FALSE,
+    score           INTEGER      DEFAULT 0,
+    brand_name      VARCHAR(255) DEFAULT '',
+    created_at      TIMESTAMP    DEFAULT NOW(),
+    UNIQUE (brand_id, url)
+);
+CREATE INDEX IF NOT EXISTS idx_threads_brand    ON threads(brand_id);
+CREATE INDEX IF NOT EXISTS idx_threads_platform ON threads(platform);
+CREATE INDEX IF NOT EXISTS idx_threads_score    ON threads(score);
+
+CREATE TABLE IF NOT EXISTS mentions (
+    id                  SERIAL PRIMARY KEY,
+    brand_id            INTEGER NOT NULL,
+    thread_id           INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    brand_mentioned     VARCHAR(255),
+    competitors_found   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mentions_thread  ON mentions(thread_id);
+
+CREATE TABLE IF NOT EXISTS drafts (
+    id          SERIAL PRIMARY KEY,
+    brand_id    INTEGER NOT NULL,
+    thread_id   INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    draft_1     TEXT,
+    draft_2     TEXT,
+    draft_3     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_drafts_thread    ON drafts(thread_id);
+
+CREATE TABLE IF NOT EXISTS insights (
+    id                  SERIAL PRIMARY KEY,
+    brand_id            INTEGER NOT NULL,
+    thread_id           INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    opportunity_type    VARCHAR(20) DEFAULT 'general',
+    why_it_matters      TEXT,
+    strategy_note       TEXT,
+    suggested_action    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_insights_thread  ON insights(thread_id);
+CREATE INDEX IF NOT EXISTS idx_insights_brand   ON insights(brand_id);
+
+CREATE TABLE IF NOT EXISTS ai_analyses (
+    id              SERIAL PRIMARY KEY,
+    brand_id        INTEGER      NOT NULL,
+    platform        VARCHAR(20)  NOT NULL,
+    section_id      VARCHAR(50)  NOT NULL,
+    section_title   VARCHAR(255),
+    section_icon    VARCHAR(10)  DEFAULT '',
+    section_order   INTEGER      DEFAULT 0,
+    content         TEXT,
+    brand_name      VARCHAR(255) DEFAULT '',
+    created_at      TIMESTAMP    DEFAULT NOW(),
+    UNIQUE (brand_id, platform, section_id)
+);
+CREATE INDEX IF NOT EXISTS idx_brand_analyses_brand   ON ai_analyses(brand_id);
+CREATE INDEX IF NOT EXISTS idx_brand_analyses_platform ON ai_analyses(platform);
 """
 
 # All columns the pages table MUST have (column_name, column_definition)
@@ -1539,3 +1612,122 @@ def db_query_pages(conn, audit_id: int) -> list:
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in rows]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Brand Intelligence DB functions (brand_scraper.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def db_insert_brand_thread(conn, brand_id: int, t: dict):
+    """Insert a scraped thread. Returns new id or None if duplicate."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO threads
+                    (brand_id, platform, url, title, subreddit, author,
+                     comment_count, claps, content, sentiment, intent,
+                     has_brand, has_competitor, score, brand_name)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (brand_id, url) DO NOTHING
+                RETURNING id
+            """, (
+                brand_id,
+                t.get("platform", "reddit"),
+                t.get("url", ""),
+                (t.get("title") or "")[:500],
+                (t.get("subreddit") or "")[:128],
+                (t.get("author") or "")[:255],
+                int(t.get("comment_count", 0) or 0),
+                int(t.get("claps", 0) or 0),
+                (t.get("content") or "")[:10000],
+                t.get("sentiment", "neutral"),
+                t.get("intent", "general"),
+                bool(t.get("has_brand", False)),
+                bool(t.get("has_competitor", False)),
+                int(t.get("score", 0) or 0),
+                (t.get("brand_name") or "")[:255],
+            ))
+            row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        logger.error(f"db_insert_brand_thread error: {e}")
+        return None
+
+
+def db_insert_brand_mention(conn, thread_id: int, brand: str, competitors: list):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO mentions (brand_id, thread_id, brand_mentioned, competitors_found)
+                SELECT bt.brand_id, %s, %s, %s
+                FROM threads bt WHERE bt.id = %s
+            """, (thread_id, brand, json.dumps(competitors), thread_id))
+        conn.commit()
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        logger.error(f"db_insert_brand_mention error: {e}")
+
+
+def db_insert_drafts(conn, thread_id: int, d1: str, d2: str, d3: str):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO drafts (brand_id, thread_id, draft_1, draft_2, draft_3)
+                SELECT bt.brand_id, %s, %s, %s, %s
+                FROM threads bt WHERE bt.id = %s
+            """, (thread_id, d1, d2, d3, thread_id))
+        conn.commit()
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        logger.error(f"db_insert_drafts error: {e}")
+
+
+def db_insert_brand_insight(conn, thread_id: int,
+                            opportunity_type: str, why: str,
+                            strategy: str, action: str):
+    valid_types = ("lead", "awareness", "defense", "general")
+    if opportunity_type not in valid_types:
+        opportunity_type = "general"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO insights
+                    (brand_id, thread_id, opportunity_type,
+                     why_it_matters, strategy_note, suggested_action)
+                SELECT bt.brand_id, %s, %s, %s, %s, %s
+                FROM threads bt WHERE bt.id = %s
+            """, (thread_id, opportunity_type, why, strategy, action, thread_id))
+        conn.commit()
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        logger.error(f"db_insert_brand_insight error: {e}")
+
+
+def db_insert_brand_analysis(conn, brand_id: int, platform: str,
+                              section_id: str, section_title: str,
+                              section_icon: str, section_order: int,
+                              content: str, brand_name: str):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO ai_analyses
+                    (brand_id, platform, section_id, section_title,
+                     section_icon, section_order, content, brand_name)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (brand_id, platform, section_id) DO UPDATE SET
+                    content       = EXCLUDED.content,
+                    section_title = EXCLUDED.section_title,
+                    section_icon  = EXCLUDED.section_icon,
+                    created_at    = NOW()
+            """, (brand_id, platform, section_id, section_title,
+                  section_icon, section_order, content, brand_name))
+        conn.commit()
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        logger.error(f"db_insert_brand_analysis error: {e}")

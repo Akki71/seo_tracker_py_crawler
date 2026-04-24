@@ -68,7 +68,16 @@ class AuditRequest(BaseModel):
 class AuditStatusResponse(BaseModel):
     job_id: str
     status: str
-    message: str
+
+
+class ScraperRequest(BaseModel):
+    brand_id:    int
+    brand:       str
+    competitors: list = []
+    keywords:    list
+    location:    str  = ""
+    platforms:   list = ["reddit", "quora", "medium", "tumblr"]
+    message: Optional[str] = ""
     audit_id: Optional[int] = None
     excel_file: Optional[str] = None
     pdf_file: Optional[str] = None
@@ -363,6 +372,184 @@ def get_generated_file(audit_id: int, file_name: str):
         raise
     except Exception as e:
         logger.error(f"get_generated_file error ({file_name}): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        release_db_conn(conn)
+
+
+# ── Brand Intelligence Scraper ─────────────────────────────────────────────────
+
+_scraper_jobs: dict = {}   # job_id → status dict
+
+
+@app.post("/scraper/start")
+def scraper_start(req: ScraperRequest):
+    """
+    Start a multi-platform brand intelligence scrape.
+
+    Payload:
+        brand_id    : int   — brand identifier (links all tables)
+        brand       : str   — brand name to search for
+        competitors : list  — competitor names e.g. ["Nike","Adidas"]
+        keywords    : list  — keywords e.g. ["running shoes","sports wear"]
+        location    : str   — optional e.g. "India", "Dubai", "UK"
+        platforms   : list  — ["reddit","quora","medium","tumblr"] or subset
+    """
+    if req.brand_id <= 0:
+        raise HTTPException(status_code=400, detail="brand_id must be positive")
+    if not req.brand or not req.brand.strip():
+        raise HTTPException(status_code=400, detail="brand name is required")
+    if not req.keywords:
+        raise HTTPException(status_code=400, detail="at least one keyword is required")
+
+    valid_platforms = {"reddit", "quora", "medium", "tumblr"}
+    platforms = [p.lower().strip() for p in req.platforms if p.lower().strip() in valid_platforms]
+    if not platforms:
+        platforms = ["reddit", "quora", "medium", "tumblr"]
+
+    import uuid
+    job_id = str(uuid.uuid4())
+    _scraper_jobs[job_id] = {
+        "job_id":    job_id,
+        "status":    "queued",
+        "brand_id":  req.brand_id,
+        "brand":     req.brand,
+        "platforms": platforms,
+        "location":  req.location,
+        "queued_at": datetime.now().isoformat(),
+        "result":    None,
+        "error":     None,
+    }
+
+    import asyncio, threading
+    def _run_in_thread():
+        _scraper_jobs[job_id]["status"] = "running"
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            from brand_scraper import run_scraper
+            result = loop.run_until_complete(run_scraper(
+                brand_id    = req.brand_id,
+                brand       = req.brand.strip(),
+                competitors = [c.strip() for c in req.competitors if c.strip()],
+                keywords    = [k.strip() for k in req.keywords    if k.strip()],
+                location    = req.location.strip(),
+                platforms   = platforms,
+            ))
+            _scraper_jobs[job_id]["status"] = "complete"
+            _scraper_jobs[job_id]["result"] = result
+            logger.info(f"[{job_id}] Scraper complete: {result}")
+        except Exception as e:
+            _scraper_jobs[job_id]["status"] = "failed"
+            _scraper_jobs[job_id]["error"]  = str(e)
+            logger.error(f"[{job_id}] Scraper failed: {e}")
+        finally:
+            try: loop.close()
+            except Exception: pass
+
+    t = threading.Thread(target=_run_in_thread, daemon=True)
+    t.start()
+
+    logger.info(f"[{job_id}] Scraper queued: brand_id={req.brand_id} "
+                f"brand={req.brand} platforms={platforms}")
+    return {"job_id": job_id, "status": "queued",
+            "brand_id": req.brand_id, "brand": req.brand,
+            "platforms": platforms, "location": req.location}
+
+
+@app.get("/scraper/status/{job_id}")
+def scraper_status(job_id: str):
+    """Get status of a brand intelligence scraper job."""
+    job = _scraper_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Scraper job {job_id} not found")
+    return job
+
+
+@app.get("/scraper/jobs")
+def scraper_jobs_list():
+    """List all scraper jobs."""
+    return {"total": len(_scraper_jobs),
+            "jobs": list(_scraper_jobs.values())}
+
+
+@app.get("/brand/{brand_id}/intelligence")
+def get_brand_intelligence(brand_id: int, platform: str = None, limit: int = 50):
+    """
+    Retrieve scraped brand intelligence for a brand.
+    Optional: ?platform=reddit|quora|medium|tumblr
+    """
+    from db import get_db_conn, release_db_conn
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            if platform:
+                cur.execute("""
+                    SELECT id, platform, url, title, subreddit, author,
+                           comment_count, claps, sentiment, intent,
+                           has_brand, has_competitor, score, created_at
+                    FROM threads
+                    WHERE brand_id=%s AND platform=%s
+                    ORDER BY score DESC LIMIT %s
+                """, (brand_id, platform, limit))
+            else:
+                cur.execute("""
+                    SELECT id, platform, url, title, subreddit, author,
+                           comment_count, claps, sentiment, intent,
+                           has_brand, has_competitor, score, created_at
+                    FROM threads
+                    WHERE brand_id=%s
+                    ORDER BY score DESC LIMIT %s
+                """, (brand_id, limit))
+            cols  = [d[0] for d in cur.description]
+            rows  = cur.fetchall()
+        threads = [dict(zip(cols, r)) for r in rows]
+        # Serialize datetime fields
+        for t in threads:
+            if t.get("created_at"):
+                t["created_at"] = t["created_at"].isoformat()
+        return {"brand_id": brand_id, "platform": platform,
+                "total": len(threads), "threads": threads}
+    except Exception as e:
+        logger.error(f"get_brand_intelligence error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        release_db_conn(conn)
+
+
+@app.get("/brand/{brand_id}/intelligence/analysis")
+def get_brand_analysis(brand_id: int, platform: str = None):
+    """Retrieve AI analysis sections for a brand."""
+    from db import get_db_conn, release_db_conn
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            if platform:
+                cur.execute("""
+                    SELECT platform, section_id, section_title, section_icon,
+                           section_order, content, brand_name, created_at
+                    FROM ai_analyses
+                    WHERE brand_id=%s AND platform=%s
+                    ORDER BY platform, section_order
+                """, (brand_id, platform))
+            else:
+                cur.execute("""
+                    SELECT platform, section_id, section_title, section_icon,
+                           section_order, content, brand_name, created_at
+                    FROM ai_analyses
+                    WHERE brand_id=%s
+                    ORDER BY platform, section_order
+                """, (brand_id,))
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+        sections = [dict(zip(cols, r)) for r in rows]
+        for s in sections:
+            if s.get("created_at"):
+                s["created_at"] = s["created_at"].isoformat()
+        return {"brand_id": brand_id, "platform": platform,
+                "total": len(sections), "sections": sections}
+    except Exception as e:
+        logger.error(f"get_brand_analysis error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         release_db_conn(conn)
